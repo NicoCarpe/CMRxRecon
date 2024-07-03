@@ -21,9 +21,13 @@ def ifft2c(kdata_tensor, dim=(-2,-1), norm='ortho'):
 def zf_recon(filename):
     '''
     load kdata and direct IFFT + RSS recon
-    return shape [t,z,y,x]
+    return shape [t,z,c,y,x], [t,z,y,x]
     '''
     kdata = load_kdata(filename)
+
+    # cmrxrecon2024 kdata is being read in as (nx,ny,nc,nz,nt), transpose it to (nt,nz,nc,ny,nx)
+    kdata = kdata.transpose(4,3,2,1,0)
+
     kdata_tensor = torch.tensor(kdata).cuda()
     image_coil = ifft2c(kdata_tensor)
     image = (image_coil.abs()**2).sum(2)**0.5
@@ -153,12 +157,15 @@ def load_kdata(filename):
     data = loadmat(filename)
     keys = list(data.keys())[0]
     kdata = data[keys]
+    
+    #TODO: Check if we can divid up the real and imaginary aspects of the kdata this way
+
     kdata = kdata['real'] + 1j*kdata['imag']
     return kdata
 
 
 
-############# help[ function #############
+############# help function #############
 def matlab_round(n):
     if n > 0:
         return int(n + 0.5)

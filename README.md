@@ -1,6 +1,6 @@
 <div align="center">    
  
-# CMR Reconstruction
+# Look at the Time: Integrating Temporal Attention into Dynamic Multi-Contrast MRI Reconstruction
 
 </div>
 

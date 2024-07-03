@@ -41,20 +41,28 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
+            "--task",
+            type=int,
+            default=1,
+            help="The task in which our data is attributed to.",
+        )
+    
+    parser.add_argument(
             "--data_path",
             type=str,
             default="~/scratch/CMR-Reconstruction/datasets/CMR_2024",
-            help="Path to the multi-coil MATLAB folder",
+            help="Path to the multi-coil MATLAB folder.",
         )
 
     parser.add_argument(
-        "--h5py_folder",
-        type=str,
-        default="~/scratch/CMR-Reconstruction/datasets/h5_FullSample2024",
-        help="the folder name to save the h5py files",
-    )
+            "--h5py_folder",
+            type=str,
+            default="h5_FullSample",
+            help="the folder name to save the h5py files.",
+        )
 
     args = parser.parse_args() 
+    task = args.task
     data_path = args.data_path
     save_folder_name = args.h5py_folder
 
@@ -95,14 +103,14 @@ if __name__ == '__main__':
         file = h5py.File(save_path, 'w')
 
         # Create a dataset 
-        # kdata is of shape (time, slice, coil, phase_enc, readout) for cine data; and (contrast, slice, coil, phase_enc, readout) for mapping data
-        # we need to reshape and transpose it to (time* slice, coil, readout, phase_enc) as 'kspace' for fastMRI style
-        save_kdata = kdata.reshape(-1,kdata.shape[2],kdata.shape[3],kdata.shape[4]).transpose(0,1,3,2)
+        # kdata is of shape (time, slice, coil, phase_enc, readout)
+        # we need to transpose it to (slice, time, coil, readout, phase_enc) as we plan to batch by the slices in fastMRI style
+        save_kdata = kdata.reshape.transpose(1,0,2,4,3)
         file.create_dataset('kspace', data=save_kdata)
 
-        # image is of shape (time, slice, phase_enc, readout) for cine data; and (contrast, slice, phase_enc, readout) for mapping data
-        # we need to reshape and transpose it to (time * slice, readout, phase_enc) as 'reconstruction_rss' for fastMRI style
-        save_image = image.reshape(-1,image.shape[2],image.shape[3]).transpose(0,2,1)
+        # image is of shape (time, slice, phase_enc, readout)
+        # we need to reshape and transpose it to (slice, time, readout, phase_enc) as 'reconstruction_rss' for fastMRI style
+        save_image = image.transpose(1,0,3,2)
         file.create_dataset('reconstruction_rss', data=save_image)
         file.attrs['max'] = image.max()
         file.attrs['norm'] = np.linalg.norm(image)
@@ -127,12 +135,14 @@ if __name__ == '__main__':
         else:
             raise ValueError('unknown acquisition type')
 
-        file.attrs['patient_id'] = save_path.split('ChallengeData/')[-1]
+        file.attrs['patient_id'] = save_path.split(save_folder_name)[-1][0:3]   # This will isolate the patient id P### 
         file.attrs['shape'] = kdata.shape
         file.attrs['padding_left'] = 0
-        file.attrs['padding_right'] = save_kdata.shape[3]
-        file.attrs['encoding_size'] = (save_kdata.shape[2],save_kdata.shape[3],1)
-        file.attrs['recon_size'] = (save_kdata.shape[2],save_kdata.shape[3],1)
+        file.attrs['padding_right'] = save_kdata.shape[4]
+        file.attrs['encoding_size'] = (save_kdata.shape[3],save_kdata.shape[4],1)
+        file.attrs['recon_size'] = (save_kdata.shape[3],save_kdata.shape[4],1)
+
+        file.attrs['masks'] = join(save_path.replace(save_folder_name, f"Mask_Task{task}").split(save_folder_name)[0], file.attrs['patient_id'])
 
         # Close the file
         file.close()

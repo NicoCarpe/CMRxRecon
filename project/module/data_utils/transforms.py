@@ -5,7 +5,7 @@ import torch
 
 import fastmri
 
-from data.subsample import MaskFunc
+from subsample import MaskFunc
 from fastmri import fft2c, ifft2c, rss_complex, complex_abs
 
 def to_tensor(data: np.ndarray) -> torch.Tensor:
@@ -62,9 +62,9 @@ def apply_mask(
 
     return masked_data, mask, num_low_frequencies
 
-class PromptMRSample(NamedTuple):
+class MRISample(NamedTuple):
     """
-    A sample of masked k-space for variational network reconstruction.
+    A sample of masked k-space for reconstruction.
 
     Args:
         masked_kspace: k-space after applying sampling mask.
@@ -73,7 +73,6 @@ class PromptMRSample(NamedTuple):
             center.
         target: The target image (if applicable).
         fname: File name.
-        slice_num: The slice index.
         max_value: Maximum image value.
         crop_size: The size to crop the final image.
     """
@@ -83,12 +82,11 @@ class PromptMRSample(NamedTuple):
     num_low_frequencies: Optional[int]
     target: torch.Tensor
     fname: str
-    slice_num: int
     max_value: float
     crop_size: Tuple[int, int]
 
 
-class PromptMrDataTransform:
+class MRIDataTransform:
     """
     Data Transformer for training VarNet models.
     """
@@ -111,9 +109,8 @@ class PromptMrDataTransform:
         mask: np.ndarray,
         target: np.ndarray,
         attrs: Dict,
-        fname: str,
-        slice_num: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str, int, float]:
+        fname: str
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str]:
         """
         Args:
             kspace: Input k-space of shape (num_coils, rows, cols) for
@@ -122,12 +119,11 @@ class PromptMrDataTransform:
             target: Target image.
             attrs: Acquisition related information stored in the HDF5 object.
             fname: File name.
-            slice_num: Serial number of the slice.
 
         Returns:
             A tuple containing, zero-filled input image, the reconstruction
             target, the mean used for normalization, the standard deviations
-            used for normalization, the filename, and the slice number.
+            used for normalization, and the filename.
         """
 
         if target is not None:
@@ -149,13 +145,12 @@ class PromptMrDataTransform:
                 kspace_torch, self.mask_func, seed=seed, padding=(acq_start, acq_end)
             )
 
-            sample = PromptMRSample(
+            sample = MRISample(
                 masked_kspace=masked_kspace,
                 mask=mask_torch.to(torch.bool),
                 num_low_frequencies=num_low_frequencies,
                 target=target_torch,
                 fname=fname,
-                slice_num=slice_num,
                 max_value=max_value,
                 crop_size=crop_size,
                 # attrs=attrs,
@@ -172,13 +167,12 @@ class PromptMrDataTransform:
             mask_torch[:, :, :acq_start] = 0
             mask_torch[:, :, acq_end:] = 0
 
-            sample = PromptMRSample(
+            sample = MRISample(
                 masked_kspace=masked_kspace,
                 mask=mask_torch.to(torch.bool),
                 num_low_frequencies=0,
                 target=target_torch,
                 fname=fname,
-                slice_num=slice_num,
                 max_value=max_value,
                 crop_size=crop_size,
                 # attrs=attrs,
@@ -186,7 +180,7 @@ class PromptMrDataTransform:
 
         return sample
     
-class FastmriKneePromptMrDataTransform:
+class FastmriKneeMRIDataTransform:
     """
     Data Transformer for training VarNet models.
     """
@@ -253,7 +247,7 @@ class FastmriKneePromptMrDataTransform:
         attrs: Dict,
         fname: str,
         slice_num: int,
-    ) -> PromptMRSample:
+    ) -> MRISample:
         """
         Args:
             kspace: Input k-space of shape (num_coils, rows, cols) for
@@ -304,7 +298,7 @@ class FastmriKneePromptMrDataTransform:
                 kspace_torch, self.mask_func, seed=seed, padding=(acq_start, acq_end)
             )
 
-            sample = PromptMRSample(
+            sample = MRISample(
                 masked_kspace=masked_kspace,
                 mask=mask_torch.to(torch.bool),
                 num_low_frequencies=num_low_frequencies,
@@ -326,7 +320,7 @@ class FastmriKneePromptMrDataTransform:
             mask_torch[:, :, :acq_start] = 0
             mask_torch[:, :, acq_end:] = 0
 
-            sample = PromptMRSample(
+            sample = MRISample(
                 masked_kspace=masked_kspace,
                 mask=mask_torch.to(torch.bool),
                 num_low_frequencies=0,
