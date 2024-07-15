@@ -158,9 +158,8 @@ def load_kdata(filename):
     keys = list(data.keys())[0]
     kdata = data[keys]
     
-    #TODO: Check if we can divid up the real and imaginary aspects of the kdata this way
-
-    kdata = kdata['real'] + 1j*kdata['imag']
+    #TODO: Check if we can divide up the real and imaginary aspects of the kdata this way
+    # kdata = kdata['real'] + 1j*kdata['imag']
     return kdata
 
 

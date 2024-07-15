@@ -57,7 +57,7 @@ if __name__ == '__main__':
     parser.add_argument(
             "--h5py_folder",
             type=str,
-            default="h5_FullSample",
+            default="h5_FullSample/",
             help="the folder name to save the h5py files.",
         )
 
@@ -97,19 +97,23 @@ if __name__ == '__main__':
         if not os.path.isdir(os.path.dirname(save_path)):
             os.makedirs(os.path.dirname(save_path))
         filename = os.path.basename(ff)
-        kdata, image = zf_recon(ff)
+
+        # <-- ff:    (x, y, c, z, t)
+        # --> kdata: (t, z, c, y, x)
+        # --> image: (t, z, y, x)
+        kdata, image = zf_recon(ff)     
 
         # Open the HDF5 file in write mode
         file = h5py.File(save_path, 'w')
 
         # Create a dataset 
         # kdata is of shape (time, slice, coil, phase_enc, readout)
-        # we need to transpose it to (slice, time, coil, readout, phase_enc) as we plan to batch by the slices in fastMRI style
+        # transpose to (slice, time, coil, readout, phase_enc) as we plan to batch by the slices in fastMRI style
         save_kdata = kdata.reshape.transpose(1,0,2,4,3)
         file.create_dataset('kspace', data=save_kdata)
 
         # image is of shape (time, slice, phase_enc, readout)
-        # we need to reshape and transpose it to (slice, time, readout, phase_enc) as 'reconstruction_rss' for fastMRI style
+        # transpose to (slice, time, readout, phase_enc) as 'reconstruction_rss' for fastMRI style
         save_image = image.transpose(1,0,3,2)
         file.create_dataset('reconstruction_rss', data=save_image)
         file.attrs['max'] = image.max()
@@ -136,7 +140,7 @@ if __name__ == '__main__':
             raise ValueError('unknown acquisition type')
 
         file.attrs['patient_id'] = save_path.split(save_folder_name)[-1][0:3]   # This will isolate the patient id P### 
-        file.attrs['shape'] = kdata.shape
+        file.attrs['shape'] = save_kdata.shape
         file.attrs['padding_left'] = 0
         file.attrs['padding_right'] = save_kdata.shape[4]
         file.attrs['encoding_size'] = (save_kdata.shape[3],save_kdata.shape[4],1)

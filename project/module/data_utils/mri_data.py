@@ -145,8 +145,8 @@ class CmrxReconDataset2024(torch.utils.data.Dataset):
                             if ks_file_info.is_file() and ks_file_info.name not in ['.', '..', '.DS_Store']:
                                 full_ks_file_path = ks_file_info.path
                                 with h5py.File(full_ks_file_path, 'r') as hf:
-                                    for mask in hf['masks']:
-                                        self.raw_samples += CMRxReconRawDataSample2024(full_ks_file_path, data_type, np.asarray(mask))
+                                    for mask_path in hf['masks']:
+                                        self.raw_samples += CMRxReconRawDataSample2024(full_ks_file_path, data_type, mask_path)
                                 
             # cache the dataset if it not already cached
             if dataset_cache.get(root) is None and use_dataset_cache:
@@ -162,12 +162,17 @@ class CmrxReconDataset2024(torch.utils.data.Dataset):
         return len(self.raw_samples)
     
     def __getitem__(self, i: int):
-        fname, data_type, mask = self.raw_samples[i]
+        fname, data_type, mask_path = self.raw_samples[i]
 
         with h5py.File(str(fname),'r') as hf:
-            kspace = hf["kspace"]
-            target = hf[self.recons_key] if self.recons_key in hf else None
+            kspace = np.asarray(hf["kspace"])
+            target = np.asarray(hf[self.recons_key]) if self.recons_key in hf else None
             attrs = dict(hf.attrs)
+        
+        with h5py.File(str(mask_path),'r') as hf:
+            keys = list(hf.keys())[0]
+            # transpose the mask into a fastMRI like format
+            mask = np.asarray(hf[keys]).traspose(2,0,1)
             
         if self.transform is None:
             sample = (kspace, mask, target, attrs, str(fname))

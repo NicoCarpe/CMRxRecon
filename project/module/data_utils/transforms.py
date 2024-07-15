@@ -52,6 +52,8 @@ def apply_mask(
             num_low_frequencies: The number of low-resolution frequency samples
                 in the mask.
     """
+    #TODO Need to adapt this function to allow for the generation and application of 3d masks as well (for task 2)
+    
     shape = (1,) * len(data.shape[:-3]) + tuple(data.shape[-3:])
     mask, num_low_frequencies = mask_func(shape, offset, seed)
     if padding is not None:
@@ -88,7 +90,7 @@ class MRISample(NamedTuple):
 
 class MRIDataTransform:
     """
-    Data Transformer for training VarNet models.
+    Data Transformer for training models.
     """
 
     def __init__(self, mask_func: Optional[MaskFunc] = None, use_seed: bool = True):
@@ -113,8 +115,7 @@ class MRIDataTransform:
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str]:
         """
         Args:
-            kspace: Input k-space of shape (num_coils, rows, cols) for
-                multi-coil data or (rows, cols) for single coil data.
+            kspace: Input k-space of shape slice, time, coil, readout, phase_enc (z, t, c, x, y)
             mask: Mask from the test dataset.
             target: Target image.
             attrs: Acquisition related information stored in the HDF5 object.
@@ -156,16 +157,22 @@ class MRIDataTransform:
                 # attrs=attrs,
             )
         else:
-            masked_kspace = kspace_torch
-            shape = np.array(kspace_torch.shape)
-            num_cols = shape[-2]
-            shape[:-3] = 1
-            mask_shape = [1] * len(shape)
-            mask_shape[-2] = num_cols
+            # Extract necessary dimensions (slice, time, coil, readout, phase_enc)
+            nz, nt, nc, nx, ny = np.array(kspace_torch.shape)
+
+            # Create the mask shape with singletons for coil and slice dimensions
+            mask_shape = (1, nt, 1, nx, ny)
+
+            # Reshape and apply the mask
             mask_torch = torch.from_numpy(mask.reshape(*mask_shape).astype(np.float32))
-            mask_torch = mask_torch.reshape(*mask_shape)
-            mask_torch[:, :, :acq_start] = 0
-            mask_torch[:, :, acq_end:] = 0
+            mask_torch[..., :acq_start] = 0
+            mask_torch[..., acq_end:] = 0
+
+            # Expand the mask to match k-space data dimensions
+            mask_torch = mask_torch.expand(nz, nt, nc, nx, ny)
+
+            # Apply the mask to k-space data
+            masked_kspace = kspace_torch * mask_torch + 0.0  # the + 0.0 removes the sign of the zeros
 
             sample = MRISample(
                 masked_kspace=masked_kspace,
@@ -309,6 +316,7 @@ class FastmriKneeMRIDataTransform:
                 crop_size=crop_size,
             )
         else:
+            #TODO maked kspace is not zero filled
             masked_kspace = kspace_torch
             shape = np.array(kspace_torch.shape)
             num_cols = shape[-2]
