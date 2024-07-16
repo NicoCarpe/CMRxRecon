@@ -6,10 +6,10 @@ from argparse import ArgumentParser
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(pathlib.Path(__file__).parent.absolute())))
 
-from data.transforms import PromptMrDataTransform
-from pl_modules.cmrxrecon_data_module import CmrxReconDataModule
-from pl_modules.promptmr_module import PromptMrModule
-from data.subsample import create_mask_for_mask_type
+from data_utils.transforms import MRIDataTransform
+from pl_modules.cmrxrecon2024_data_module import CmrxReconDataModule
+#from pl_modules.promptmr_module import PromptMrModule
+from data_utils.subsample import create_mask_for_mask_type
 import pytorch_lightning as pl
 
 
@@ -20,14 +20,18 @@ def cli_main(args):
     # ------------
     # data
     # ------------
+
+    # TODO: make sure that this part is integrated for pre generated masks
+    
     # this creates a k-space mask for transforming input data
     mask = create_mask_for_mask_type(
         args.mask_type, None, args.accelerations, args.center_numbers
     )
     # use equispaced_fixed masks for train transform, fixed masks for val transform
-    train_transform = PromptMrDataTransform(mask_func=mask, use_seed=False)
-    val_transform = PromptMrDataTransform(mask_func=mask)
-    test_transform = PromptMrDataTransform()
+    train_transform = MRIDataTransform(mask_func=mask, use_seed=False)
+    val_transform = MRIDataTransform(mask_func=mask)
+    test_transform = MRIDataTransform()
+
     # ptl data module - this handles data loaders
     data_module = CmrxReconDataModule(
         data_path=args.data_path,
@@ -46,6 +50,9 @@ def cli_main(args):
             "ddp_find_unused_parameters_false", "ddp", "ddp_cpu")),
     )
 
+
+    # TODO: this is where we need to link to our updated pl model
+    
     # ------------
     # model
     # ------------

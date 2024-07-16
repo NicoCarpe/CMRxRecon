@@ -73,7 +73,7 @@ class PromptMrModule(MriModule):
             lr_gamma: Learning rate gamma decay.
             weight_decay: Parameter for penalizing weights norm.
             use_checkpoint: Whether to use checkpointing to trade compute for GPU memory.
-            low_mem: Whether to compute sensitivity map coil by coil to save GPU memory.
+            low_mem: Whether to compute sensitiavity map coil by coil to save GPU memory.
 
         """
         super().__init__(**kwargs)

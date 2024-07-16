@@ -115,7 +115,7 @@ class MRIDataTransform:
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str]:
         """
         Args:
-            kspace: Input k-space of shape slice, time, coil, readout, phase_enc (z, t, c, x, y)
+            kspace: Input k-space of shape time, coil, readout, phase_enc (t, c, x, y)
             mask: Mask from the test dataset.
             target: Target image.
             attrs: Acquisition related information stored in the HDF5 object.
@@ -157,11 +157,11 @@ class MRIDataTransform:
                 # attrs=attrs,
             )
         else:
-            # Extract necessary dimensions (slice, time, coil, readout, phase_enc)
-            nz, nt, nc, nx, ny = np.array(kspace_torch.shape)
+            # Extract necessary dimensions (time, coil, readout, phase_enc)
+            nt, nc, nx, ny = np.array(kspace_torch.shape)
 
-            # Create the mask shape with singletons for coil and slice dimensions
-            mask_shape = (1, nt, 1, nx, ny)
+            # Create the mask shape with singletons for coil dimension
+            mask_shape = (nt, 1, nx, ny)
 
             # Reshape and apply the mask
             mask_torch = torch.from_numpy(mask.reshape(*mask_shape).astype(np.float32))
@@ -169,7 +169,7 @@ class MRIDataTransform:
             mask_torch[..., acq_end:] = 0
 
             # Expand the mask to match k-space data dimensions
-            mask_torch = mask_torch.expand(nz, nt, nc, nx, ny)
+            mask_torch = mask_torch.expand(nt, nc, nx, ny)
 
             # Apply the mask to k-space data
             masked_kspace = kspace_torch * mask_torch + 0.0  # the + 0.0 removes the sign of the zeros

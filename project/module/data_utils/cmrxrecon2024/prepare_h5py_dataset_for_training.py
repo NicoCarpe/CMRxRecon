@@ -107,8 +107,8 @@ if __name__ == '__main__':
         file = h5py.File(save_path, 'w')
 
         # Create a dataset 
-        # kdata is of shape (time, slice, coil, phase_enc, readout)
-        # transpose to (slice, time, coil, readout, phase_enc) as we plan to batch by the slices in fastMRI style
+        # kdata is of shape time, slice, coil, phase_enc, readout (t, z, c, y, x)
+        # transpose to slice, time, coil, readout, phase_enc (z, t, c, x, y) as we plan to batch by the slices in fastMRI style
         save_kdata = kdata.reshape.transpose(1,0,2,4,3)
         file.create_dataset('kspace', data=save_kdata)
 
