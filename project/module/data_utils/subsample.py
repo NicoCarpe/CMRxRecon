@@ -181,7 +181,7 @@ class MaskFunc:
             num_low_freqs: Number of low-frequency lines to sample.
 
         Returns:
-            A mask for hte low spatial frequencies of k-space.
+            A mask for the low spatial frequencies of k-space.
         """
         num_cols = shape[-2]
         mask = np.zeros(num_cols, dtype=np.float32)

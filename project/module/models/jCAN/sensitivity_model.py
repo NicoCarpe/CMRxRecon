@@ -6,7 +6,7 @@ Created on Wed Apr 27 07:21:26 2022
 @author: sunkg
 
 Jul 23, 2024
-Extended to 2D+t by Nicolas Carpenter <ngcarpen@ualberta.ca>
+Extended by Nicolas Carpenter <ngcarpen@ualberta.ca>
 """ 
 
 import torch.nn as nn

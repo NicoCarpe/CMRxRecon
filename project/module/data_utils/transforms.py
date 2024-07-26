@@ -316,7 +316,7 @@ class FastmriKneeMRIDataTransform:
                 crop_size=crop_size,
             )
         else:
-            #TODO maked kspace is not zero filled
+            #TODO masked kspace is not zero filled
             masked_kspace = kspace_torch
             shape = np.array(kspace_torch.shape)
             num_cols = shape[-2]

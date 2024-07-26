@@ -3,7 +3,7 @@ Oct 12, 2021
 Combined and modified by Kaicong Sun <sunkc@shanghaitech.edu.cn>
 
 Jul 23, 2024
-Extended to 2D+t by Nicolas Carpenter <ngcarpen@ualberta.ca>
+Extended by Nicolas Carpenter <ngcarpen@ualberta.ca>
 """
 
 import math
@@ -70,10 +70,10 @@ class Unet3D(nn.Module):
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            image: Input 5D tensor of shape `(N, in_chans, T, H, W)`.
+            image: Input 5D tensor of shape `(B, in_chans, T, H, W)`.
 
         Returns:
-            Output tensor of shape `(N, out_chans, T, H, W)`.
+            Output tensor of shape `(B, out_chans, T, H, W)`.
         """
         assert not torch.is_complex(image)
         stack = []
@@ -254,10 +254,10 @@ class ConvBlock3D(nn.Module):
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            image: Input 5D tensor of shape `(N, in_chans, T, H, W)`.
+            image: Input 5D tensor of shape `(B, in_chans, T, H, W)`.
 
         Returns:
-            Output tensor of shape `(N, out_chans, T, H, W)`.
+            Output tensor of shape `(B, out_chans, T, H, W)`.
         """
         return self.layers(image)
 
@@ -297,10 +297,10 @@ class GatedConvBlock3D(nn.Module):
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            image: Input 5D tensor of shape `(N, in_chans, T, H, W)`.
+            image: Input 5D tensor of shape `(B, in_chans, T, H, W)`.
 
         Returns:
-            Output tensor of shape `(N, out_chans, T, H, W)`.
+            Output tensor of shape `(B, out_chans, T, H, W)`.
         """
         x_img = self.layers(image)
         x_gate = self.gatedlayers(image)
@@ -313,8 +313,8 @@ class GatedConvBlock3D(nn.Module):
 
 class ConvBlockSM3D(nn.Module):
     """
-    A Convolutional Block that consists of two convolution layers each followed by
-    instance normalization, LeakyReLU activation, and dropout.
+    A Convolutional Block that consists of convolution layers each followed by
+    instance normalization, LeakyReLU activation, and spatiotemporal attention.
     """
 
     def __init__(self, in_chans=2, conv_num=0, out_chans=None, max_chans=None):
@@ -336,8 +336,8 @@ class ConvBlockSM3D(nn.Module):
             nn.LeakyReLU(negative_slope=0.2, inplace=True)
         ))
 
-        #### Spatial Attention ####
-        self.SA = utils.SpatialAttention()
+        #### Spatiotemporal Attention ####
+        self.STA = utils.SpatiotemporalAttention(in_channels=self.chans_max)
 
         for index in range(conv_num):
             if index == conv_num - 1:
@@ -358,17 +358,19 @@ class ConvBlockSM3D(nn.Module):
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            image: Input 5D tensor of shape `(N, in_chans, T, H, W)`.
+            image: Input 5D tensor of shape `(B, in_chans, T, H, W)`.
 
         Returns:
-            Output tensor of shape `(N, out_chans, T, H, W)`.
+            Output tensor of shape `(B, out_chans, T, H, W)`.
         """
         output = self.body(image)
         output = output + image[:, :2, :, :, :]
-        #### Spatial Attention ###
-        output = self.SA(output) * output
+        
+        #### Spatiotemporal Attention ###
+        output = self.STA(output) * output
 
         return output
+
 
 #########################################################################################################
 # 3D Transpose Convolution
@@ -402,10 +404,10 @@ class TransposeConvBlock3D(nn.Module):
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            image: Input 5D tensor of shape `(N, in_chans, T, H, W)`.
+            image: Input 5D tensor of shape `(B, in_chans, T, H, W)`.
 
         Returns:
-            Output tensor of shape `(N, out_chans, T, H*2, W*2)`.
+            Output tensor of shape `(B, out_chans, T, H*2, W*2)`.
         """
         return self.layers(image)
 

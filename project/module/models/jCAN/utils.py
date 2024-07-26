@@ -1,21 +1,28 @@
+"""
+@author: sunkg
+
+Jul 23, 2024
+Extended by Nicolas Carpenter <ngcarpen@ualberta.ca>
+"""
+
 import torch.nn as nn
 import torch
 import torch.fft
 import torch.nn.functional as F
 
-def fft2d(x):
+def fft2(x):
     assert len(x.shape) == 5  # Ensure the input is 5D (B, C, T, H, W)
     return torch.fft.fft2(x, dim=(-2, -1), norm='ortho')
 
-def ifft2d(x):
+def ifft2(x):
     assert len(x.shape) == 5  # Ensure the input is 5D (B, C, T, H, W)
     return torch.fft.ifft2(x, dim=(-2, -1), norm='ortho')
 
-def fftshift2d(x):
+def fftshift2(x):
     assert len(x.shape) == 5  # Ensure the input is 5D (B, C, T, H, W)
     return torch.roll(x, shifts=(x.shape[-2] // 2, x.shape[-1] // 2), dims=(-2, -1))
 
-def ifftshift2d(x):
+def ifftshift2(x):
     assert len(x.shape) == 5  # Ensure the input is 5D (B, C, T, H, W)
     return torch.roll(x, shifts=((x.shape[-2] + 1) // 2, (x.shape[-1] + 1) // 2), dims=(-2, -1))
 
@@ -69,10 +76,12 @@ def chan_dim_to_complex(x: torch.Tensor) -> torch.Tensor:
     return torch.complex(x[:, :c], x[:, c:])
 
 def sens_expand(image: torch.Tensor, sens_maps: torch.Tensor) -> torch.Tensor:
-    return fft2d(image * sens_maps)
+    return fft2(image * sens_maps)
+
 
 def sens_reduce(kspace: torch.Tensor, sens_maps: torch.Tensor) -> torch.Tensor:
-    return (ifft2d(kspace) * sens_maps.conj()).sum(dim=1, keepdim=True)
+    return (ifft2(kspace) * sens_maps.conj()).sum(dim=1, keepdim=True)
+
 
 class SpatialAttention(nn.Module):
     def __init__(self):
@@ -85,4 +94,18 @@ class SpatialAttention(nn.Module):
         maxout, _ = torch.max(x, dim=1, keepdim=True)
         out = torch.cat([avgout, maxout], dim=1)
         out = self.sigmoid(self.conv2d(out))
+        return out
+
+
+class SpatiotemporalAttention(nn.Module):
+    def __init__(self, in_channels):
+        super(SpatiotemporalAttention, self).__init__()
+        self.conv3d = nn.Conv3d(in_channels=in_channels, out_channels=1, kernel_size=(7, 7, 7), stride=1, padding=(3, 3, 3))
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avgout = torch.mean(x, dim=1, keepdim=True)
+        maxout, _ = torch.max(x, dim=1, keepdim=True)
+        out = torch.cat([avgout, maxout], dim=1)
+        out = self.sigmoid(self.conv3d(out))
         return out

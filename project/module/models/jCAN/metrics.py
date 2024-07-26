@@ -67,38 +67,9 @@ def ssim(gt, pred, gt_flag=True):
     return ssim
 
 
-def dice(gt, pred, label=None):
-    gt, pred = to_numpy(gt, pred)
-    if label is None:
-        gt, pred = gt.astype(np.bool), pred.astype(np.bool)
-    else:
-        gt, pred = (gt == label), (pred == label)
-    intersection = np.logical_and(gt, pred)
-    return 2.*intersection.sum() / (gt.sum() + pred.sum())
-
-
-from scipy.special import xlogy
-def mi(gt, pred, bins=64, minVal=0, maxVal=1):
-    assert gt.shape == pred.shape
-    gt, pred = to_numpy(gt, pred)
-    mi = []
-    for x, y in zip(gt, pred):
-        Pxy = np.histogram2d(x.ravel(), y.ravel(), bins, \
-                range=((minVal,maxVal),(minVal,maxVal)))[0]
-        Pxy = Pxy/(Pxy.sum()+1e-10)
-        Px = Pxy.sum(axis=1)
-        Py = Pxy.sum(axis=0)
-        PxPy = Px[..., None]*Py[None, ...]
-        #mi = Pxy * np.log(Pxy/(PxPy+1e-6))
-        result = xlogy(Pxy, Pxy) - xlogy(Pxy, PxPy)
-        mi.append(result.sum())
-    return np.mean(mi).item()
-
-
 if __name__ == "__main__":
     gt, pred = np.random.rand(10, 1, 100, 100), np.random.rand(10, 1, 100, 100)
     print('MSE', mse(gt, pred))
     print('NMSE', nmse(gt, pred))
     print('PSNR', psnr(gt, pred))
     print('SSIM', ssim(gt, pred))
-    print('MI', mi(gt, pred))
