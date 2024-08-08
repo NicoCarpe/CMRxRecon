@@ -13,9 +13,9 @@ This project repository contains the PyTorch implementation of our unrolled mode
 ## Method
 TODO
   
-![Contrasts Image](projet/support/Task1&2_ContrastImageCMR.png "Contrasts and Views")
+![Contrasts Image](project/support/Task1&2_ContrastImageCMR.png "Contrasts and Views")
 
-![Masks Image](projet/support/Task1&2_MaskCMR.png "Undersampling Masks")
+![Masks Image](project/support/Task1&2_MaskCMR.png "Undersampling Masks")
 
 
 ## How to install
