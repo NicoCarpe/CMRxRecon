@@ -1,122 +1,80 @@
 <div align="center">    
  
-# Look at the Time: Integrating Temporal Attention into Dynamic Multi-Contrast MRI Reconstruction
+# Integrating Temporal Attention into Dynamic Multi-Contrast MRI Reconstruction
 
 </div>
 
-
-## Introduction
+This project repository contains the PyTorch implementation of our unrolled model for multi-contrast Cardiac MRI reconstruction
 
 **Contact**
-Nicolas Carpenter: ngcarpen@ualberta.ca
+- Nicolas Carpenter: ngcarpen@ualberta.ca
 
 
-## 1. Description
-This repository implements the  
-- Our code offers the following things:
+## Method
+TODO
   
+![Contrasts Image](projet/support/Task1&2_ContrastImageCMR.png "Contrasts and Views")
+
+![Masks Image](projet/support/Task1&2_MaskCMR.png "Undersampling Masks")
 
 
-## 2. How to install
-We highly recommend you to use our conda environment.
+## How to install
 ```bash
 # clone project   
-git clone https://github.com/NicoCarpe/CMR-Reconstruction.git
-
-# install project   
-cd CMR-Reconstruction
-conda env create -f envs/py39.yaml
-conda activate py39
+git clone https://github.com/NicoCarpe/CMRxRecon.git
  ```
 
-## 3. Project Structure
-Our directory structure looks like this:
+## Project Structure
+Our directory structure looks similar to this:
 
 ```
-├── output                       <- Experiment log and checkpoints will be saved here once you train a model
-├── envs                         <- Conda environment
-├── pretrained_models            <- Pretrained model checkpoints
+├── configs                        <- Training, evaluation, and environment configs
+├── datasets                    
+├── imgs                        
+├── output                         <- Experiment log and checkpoints will be saved here once you train a model
+├── pretrained_models              <- Pretrained model checkpoints
 ├── project                 
-│   ├── module                   <- Every module is given in this directory
-│   │   ├── models               <- Models (Swin fMRI Transformer)
-│   │   ├── utils                
-│   │   │    ├── data_module.py  <- Dataloader & codes for matching CMR scans and target variables
-│   │   │    └── data_preprocessing_and_load
-│   │   │        ├── datasets.py           <- Dataset Class for each dataset
-│   │   │        └── preprocessing.py      <- Preprocessing codes for step 6
-│   │   └── pl_classifier.py    <- LightningModule
-│   └── main.py                 <- Main code that trains and tests the model
+│   ├── data_modules           
+│   │    ├── data_module.py        <- PyTorch Lightning module for data 
+│   │    └── model_module.py       <- PyTorch Lightning module for model
+│   │
+│   ├── data_utils               
+│   │    ├── basemodel.py          <- Provides methods for building, saving, and loading model states
+│   │    ├── CNN.py                <- UNet implementation
+│   │    ├── fS2RT3D.py            <- Sensitivity map refinement and dual-domain reconstruction block
+│   │    ├── metrics.py            <- Metrics for model evaluation
+│   │    ├── model.py              <- Unrolled reconstruction model
+│   │    ├── sensitivity_model.py  <- Sensitivity map estimation 
+│   │    └── SwinTransformer3D.py  <- 3d image domain swin transformer
+│   │
+│   ├── eval                       <- Code for model evaluation
+│   ├── model                   
+│   │    ├── mri_datasets.py       <- Dataset Class for each dataset
+│   │    ├── transforms.py         <- Dataset Class for each dataset
+│   │    └── preprocessing.py      <-
+│   │
+│   ├── support                    <- Supporting code for CMRxRecon2024 challenge
+│   └── training                   <- Code for model training
 │ 
-├── scripts                     <- shell scripts for training
-│
-├── .gitignore                  <- List of files/folders ignored by git
-├── export_DDP_vars.sh          <- setup file for running torch DistributedDataParallel (DDP) 
+├── scripts                        <- Bash scripts for training and evaluation
+├── .gitignore                     <- List of files/folders ignored by git
 └── README.md
 ```
 
 <br>
 
-## 4. Train model
+## Training/Inference
 
-### 4.0 Quick start & Tutorial
+Scripts are provided to run this model using SLURM. After adjusting the train_config.yaml file, submit_batch_train.sh can be used to schedule the data preprocessing and the training of the model.
 
-### 4.1 Arguments for trainer
+After adjusting the eval_config.yaml file, submit_batch_eval.sh can be used to schedule the testing of the specified model checkpoint.
 
-### 4.2 Hidden Arguments for PyTorch lightning
+## Citation
+```bibtex
 
-### 4.3 Commands/scripts for running tasks
-
-## 5. Loggers
-
-## 6. How to prepare your own dataset
-These preprocessing codes are implemented based on the initial repository by GonyRosenman [TFF](https://github.com/GonyRosenman/TFF)
-
-To make your own dataset, you should execute either of the minimal preprocessing steps:
-
-After the minimal preprocessing steps, you should perform additional preprocessing to use SwiFT. (You can find the preprocessing code at 'project/module/utils/data_preprocessing_and_load/preprocessing.py')
-- normalization: voxel normalization(not used) and whole-brain z-normalization (mainly used)
-- change fMRI volumes to floating point 16 to save storage and decrease IO bottleneck.
-- each fMRI volume is saved separately as torch checkpoints to facilitate window-based training.
-- remove non-brain(background) voxels that are over 96 voxels.
-   - you should open your fMRI scans to determine the level that does not cut out the brain regions
-   - you can use `nilearn` to visualize your fMRI data. (official documentation: [here](https://nilearn.github.io/dev/index.html))
-  ```python
-  from nilearn import plotting
-  from nilearn.image import mean_img
-  
-  plotting.view_img(mean_img(fmri_filename), threshold=None)
-  ```
-   - if your dimension is under 96, you can pad non-brain voxels at 'datasets.py' files.
-
-* refer to the annotation in the 'preprocessing.py' code to adjust it for your own datasets.
-
-The resulting data structure is as follows:
-```
-├── {Dataset name}_MNI_to_TRs                 
-   ├── img                  <- Every normalized volume is located in this directory
-   │   ├── sub-01           <- subject name
-   │   │  ├── frame_0.pt    <- Each torch pt file contains one volume in a fMRI sequence (total number of pt files = length of fMRI sequence)
-   │   │  ├── frame_1.pt
-   │   │  │       :
-   │   │  └── frame_{T}.pt  <- the last volume in an fMRI sequence (length T) 
-   │   └── sub-02              
-   │   │  ├── frame_0.pt    
-   │   │  ├── frame_1.pt
-   │   │  ├──     :
-   └── metadata
-       └── metafile.csv     <- file containing target variable
+}
 ```
 
-## 7. Define the Dataset class for your own dataset.
-* The data loading pipeline works by processing image and metadata at 'project/module/utils/data_module.py' and passing the paired image-label tuples to the Dataset classes at 'project/module/utils/data_preprocessing_and_load/datasets.py.'
-* you should implement codes for combining image path, subject_name, and target variables at 'project/module/utils/data_module.py'
-* you should define the Dataset Class for your dataset at 'project/module/utils/data_preprocessing_and_load/datasets.py.' In the Dataset class (__getitem__), you should specify how many background voxels you would add or remove to make the volumes shaped 96 * 96 * 96.
+## Acknowledgements
+TODO
 
-## 8. Pretrained model checkpoints
-
-
-
-### Citation   
-```
-
-```   
