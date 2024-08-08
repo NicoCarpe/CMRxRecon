@@ -1,0 +1,41 @@
+seed: 42
+mode: 'train'
+num_gpus: 2
+exp_name: 'cmrxrecon2024'
+data_path: '~scratch/CMR-Reconstruction/datasets/CMR_2024/'
+challenge: 'multicoil'
+combine_train_val: true
+sample_rate: 1.0
+batch_size: 1
+num_workers: 4
+run_preprocessing: true
+
+# Learning rate and optimizer parameters
+lr: 0.0003
+lr_step_size: 40
+lr_gamma: 0.1
+weight_decay: 0.0
+
+# Model parameters
+coils: 10
+num_heads: [3, 6, 12, 24]
+window_size: [8, 32, 32]
+depths: [2, 2, 18, 2]
+patch_size: [4, 4, 4]
+embed_dim: 96
+mlp_ratio: 4.0
+use_amp: False
+num_recurrent: 25
+sens_chans: 8
+sens_steps: 4
+lambda0: 10.0
+lambda1: 10.0
+lambda2: 1.0
+lambda3: 100.0
+GT: True
+n_SC: 1
+
+# Training parameters
+max_epochs: 20
+gradient_clip_val: 0.01
+use_checkpoint: True
