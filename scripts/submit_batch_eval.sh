@@ -1,32 +1,53 @@
 #!/bin/bash -l
-#SBATCH --time=4:00:00
-#SBATCH -p gpu
+#SBATCH -J cmrxrecon_eval
+#SBATCH --time=2:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=8
+#SBATCH --gpus-per-node=v100l:1
 #SBATCH --cpus-per-gpu=8
-#SBATCH -J cmrxrecon_eval
-#SBATCH --open-mode=append
-#SBATCH -C h100
+#SBATCH --mem=32G
+#SBATCH --account=def-punithak
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --mail-user=ngcarpen@ualberta.ca
+#SBATCH --output=slurm_logs/out/%x_%j.out
+#SBATCH --error=slurm_logs/err/%x_%j.err
 
 export HDF5_USE_FILE_LOCKING=FALSE
 export OMP_NUM_THREADS=6
 
-master_node=$SLURMD_NODENAME
-ENV_DIR=$SCRATCH/cmrxrecon_env
-config="eval_config.yaml"
+config=~/scratch/CMR-Reconstruction/configs/eval_config.yaml
 
 module purge
-module load gcc openmpi/4.0.7 python-mpi/3.11.2
-module load hdf5/mpi-1.12.2
-module load cuda/12.1 cudnn/cuda12-8.9.0 nccl/cuda12.1-2.18.1
 
-# Create conda environment if it does not exist
-if [ ! -d "$ENV_DIR" ]; then
-    module load miniconda
-    conda create -p $ENV_DIR --file env.yaml -y
+# Load necessary modules
+module load matlab/2023b
+module load StdEnv/2023
+module load gcc/12.3
+module load hdf5/1.12.2
+module load cuda/12.2
+module load cudnn/8.9.5.29
+module load nccl/2.18.3
+module load python/3.10
+
+# Create and activate a virtual environment
+virtualenv --no-download $SLURM_TMPDIR/env
+source $SLURM_TMPDIR/env/bin/activate
+
+# Upgrade pip
+pip install --no-index --upgrade pip
+
+# Install packages from Compute Canada wheels
+pip install --no-index -r ~/scratch/CMR-Reconstruction/configs/requirements_local.txt
+
+# Install packages from PyPI or other sources
+pip install -r ~/scratch/CMR-Reconstruction/configs/requirements_pypi.txt
+
+# Verify the configuration file exists
+if [ ! -f "$config" ]; then
+    echo "Configuration file $config not found!"
+    exit 1
 fi
 
-source activate $ENV_DIR
 
-srun python eval.py --config $config
+# Run evaluation
+srun python ~/scratch/CMR-Reconstruction/eval/eval.py --config $config

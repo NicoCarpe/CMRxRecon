@@ -1,6 +1,4 @@
 import os
-import sys
-import pathlib
 import argparse
 import yaml
 import torch
@@ -11,13 +9,11 @@ import numpy as np
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 import matlab.engine
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(pathlib.Path(__file__).parent.absolute())))
 import fastmri.data.transforms as T
-from models.jCAN.model import ReconModel
-from models.jCAN.utils import pad_to_max_size, unpad_from_max_size, create_padding_mask
-from data_utils.cmrxrecon2024.utils import load_kdata, loadmat
-from data_utils.cmrxrecon2024.utils import count_parameters, count_trainable_parameters, count_untrainable_parameters
+from ..model.model import ReconModel
+from ..model.utils import pad_to_max_size, unpad_from_max_size, create_padding_mask
+from ..data_utils.cmrxrecon2024.utils import load_kdata, loadmat
+from ..data_utils.cmrxrecon2024.utils import count_parameters, count_trainable_parameters, count_untrainable_parameters
 
 class Dataset(torch.utils.data.Dataset):
     def __init__(self, fname, num_low_frequencies):

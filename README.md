@@ -29,36 +29,36 @@ Our directory structure looks similar to this:
 
 ```
 ├── configs                        <- Training, evaluation, and environment configs
+├── data_modules           
+│    ├── data_module.py            <- PyTorch Lightning module for data 
+│    └── model_module.py           <- PyTorch Lightning module for model
+│
+├── data_utils       
+│    ├── mri_datasets.py           <- Dataset Class for each dataset
+│    ├── preprocessing.py          <- Preprocessing utilities
+│    └── transforms.py             <- Dataset transformations        
+│
 ├── datasets                    
+├── eval                           <- Code for model evaluation
 ├── imgs                        
+├── model    
+│    ├── basemodel.py              <- Provides methods for building, saving, and loading model states
+│    ├── CNN.py                    <- UNet implementation
+│    ├── fS2RT3D.py                <- Sensitivity map refinement and dual-domain reconstruction block
+│    ├── metrics.py                <- Metrics for model evaluation
+│    ├── SwinTransformer3D.py      <- 3D image domain swin transformer
+│    ├── model.py                  <- Unrolled reconstruction model
+│    └── sensitivity_model.py      <- Sensitivity map estimation                    
+│
 ├── output                         <- Experiment log and checkpoints will be saved here once you train a model
 ├── pretrained_models              <- Pretrained model checkpoints
-├── project                 
-│   ├── data_modules           
-│   │    ├── data_module.py        <- PyTorch Lightning module for data 
-│   │    └── model_module.py       <- PyTorch Lightning module for model
-│   │
-│   ├── data_utils               
-│   │    ├── basemodel.py          <- Provides methods for building, saving, and loading model states
-│   │    ├── CNN.py                <- UNet implementation
-│   │    ├── fS2RT3D.py            <- Sensitivity map refinement and dual-domain reconstruction block
-│   │    ├── metrics.py            <- Metrics for model evaluation
-│   │    ├── model.py              <- Unrolled reconstruction model
-│   │    ├── sensitivity_model.py  <- Sensitivity map estimation 
-│   │    └── SwinTransformer3D.py  <- 3d image domain swin transformer
-│   │
-│   ├── eval                       <- Code for model evaluation
-│   ├── model                   
-│   │    ├── mri_datasets.py       <- Dataset Class for each dataset
-│   │    ├── transforms.py         <- Dataset Class for each dataset
-│   │    └── preprocessing.py      <-
-│   │
-│   ├── support                    <- Supporting code for CMRxRecon2024 challenge
-│   └── training                   <- Code for model training
-│ 
+├── README.md
 ├── scripts                        <- Bash scripts for training and evaluation
+├── support                        <- Supporting code for CMRxRecon2024 challenge
 ├── .gitignore                     <- List of files/folders ignored by git
-└── README.md
+└── training                       <- Code for model training
+     └── train_cmrxrecon2024.py    <- Main training script
+
 ```
 
 <br>

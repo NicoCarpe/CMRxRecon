@@ -11,7 +11,7 @@ import pytorch_lightning as pl
 import torch
 
 import fastmri
-from data_utils.mri_data import CombinedFastmriKneeSliceDataset, FastmriKneeSliceDataset
+from ..data_utils.mri_datasets import CombinedFastmriKneeSliceDataset, FastmriKneeSliceDataset
 
 
 def _check_both_not_none(val1, val2):

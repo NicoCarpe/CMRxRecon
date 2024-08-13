@@ -1,16 +1,11 @@
 import os
-import sys
-import pathlib
 from argparse import ArgumentParser
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import TensorBoardLogger
 import yaml
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(pathlib.Path(__file__).parent.absolute())))
-
-from data_utils.transforms import MRIDataTransform
-from data_modules.cmrxrecon2024_data_module import CmrxReconDataModule
-from data_modules.model_module import ReconMRIModule
+from ..data_utils.transforms import MRIDataTransform
+from ..data_modules.cmrxrecon2024_data_module import CmrxReconDataModule
+from ..data_modules.model_module import ReconMRIModule
 
 def cli_main(args):
     pl.seed_everything(args.seed)
@@ -65,7 +60,8 @@ def cli_main(args):
     # ------------
     # logger
     # ------------
-    logger = TensorBoardLogger("logs/", name="ReconMRI")
+    output_dir = os.path.join(args.output_dir, "logs")
+    logger = TensorBoardLogger(save_dir=output_dir, name="ReconMRI")
 
     # ------------
     # trainer

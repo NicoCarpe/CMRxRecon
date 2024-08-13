@@ -11,7 +11,7 @@ import pytorch_lightning as pl
 import torch
 
 import fastmri
-from data.mri_data import CombinedCmrxReconSliceDataset2023, CmrxReconSliceDataset2023
+from ..data_utils.mri_datasets import CombinedCmrxReconSliceDataset2023, CmrxReconSliceDataset2023
 
 
 def worker_init_fn(worker_id):

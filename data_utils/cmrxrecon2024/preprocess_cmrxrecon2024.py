@@ -1,8 +1,5 @@
 import os
 import sys
-import pathlib
-sys.path.insert(0, os.path.dirname(os.path.dirname(pathlib.Path(__file__).parent.absolute())))
-
 import shutil
 import argparse
 import numpy as np

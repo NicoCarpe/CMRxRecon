@@ -2,7 +2,8 @@ seed: 42
 mode: 'train'
 num_gpus: 2
 exp_name: 'cmrxrecon2024'
-data_path: '~scratch/CMR-Reconstruction/datasets/CMR_2024/'
+data_path: '~scratch/CMR-Reconstruction/datasets/CMR_2024/ChallengeData/Multicoil/'
+output_dir: '~scratch/CMR-Reconstruction/outputs'
 challenge: 'multicoil'
 combine_train_val: true
 sample_rate: 1.0

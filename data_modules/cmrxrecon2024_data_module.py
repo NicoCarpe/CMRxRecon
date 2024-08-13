@@ -9,10 +9,10 @@ from typing import Callable, Optional, Union
 
 import pytorch_lightning as pl
 import torch
+import os
 
 import fastmri
-from data_utils.mri_datasets import CombinedCmrxReconSliceDataset2024, CmrxReconSliceDataset2024
-
+from ..data_utils.mri_datasets import CombinedCmrxReconSliceDataset2024, CmrxReconSliceDataset2024
 
 def worker_init_fn(worker_id):
     """Handle random seeding for all mask_func."""
@@ -21,7 +21,7 @@ def worker_init_fn(worker_id):
         CmrxReconSliceDataset2024, CombinedCmrxReconSliceDataset2024
     ] = worker_info.dataset  # pylint: disable=no-member
 
-    # Check if we are using DDP
+    # Check if we are using DDP (Distributed Data Parallel)
     is_ddp = False
     if torch.distributed.is_available():
         if torch.distributed.is_initialized():
@@ -33,9 +33,8 @@ def worker_init_fn(worker_id):
     if isinstance(data, CombinedCmrxReconSliceDataset2024):
         for i, dataset in enumerate(data.datasets):
             if dataset.transform.mask_func is not None:
-                if (
-                    is_ddp
-                ):  # DDP training: unique seed is determined by worker, device, dataset
+                if is_ddp:
+                    # DDP training: unique seed is determined by worker, device, dataset
                     seed_i = (
                         base_seed
                         - worker_info.id
@@ -45,6 +44,7 @@ def worker_init_fn(worker_id):
                         + i
                     )
                 else:
+                    # Non-DDP: Seed is just adjusted by worker id and dataset index
                     seed_i = (
                         base_seed
                         - worker_info.id
@@ -53,14 +53,15 @@ def worker_init_fn(worker_id):
                     )
                 dataset.transform.mask_func.rng.seed(seed_i % (2**32 - 1))
     elif data.transform.mask_func is not None:
-        if is_ddp:  # DDP training: unique seed is determined by worker and device
+        if is_ddp:
+            # DDP training: unique seed is determined by worker and device
             seed = base_seed + torch.distributed.get_rank() * worker_info.num_workers
         else:
             seed = base_seed
         data.transform.mask_func.rng.seed(seed % (2**32 - 1))
 
-
 def _check_both_not_none(val1, val2):
+    """Check if both values are not None. Used to ensure mutually exclusive arguments."""
     if (val1 is not None) and (val2 is not None):
         return True
 
@@ -68,22 +69,18 @@ def _check_both_not_none(val1, val2):
 
 class CmrxReconDataModule(pl.LightningDataModule):
     """
-    Data module class for fastMRI data sets.
+    Data module class for fastMRI and CMRxRecon data sets.
 
-    This class handles configurations for training on fastMRI data. It is set
-    up to process configurations independently of training modules.
+    This class handles configurations for training and validation data.
+    It abstracts away data handling specifics from the main training script.
 
     Note that subsampling mask and transform configurations are expected to be
-    done by the main client training scripts and passed into this data module.
-
-    For training with ddp be sure to set distributed_sampler=True to make sure
-    that volumes are dispatched to the same GPU for the validation loop.
+    passed into this data module.
     """
 
     def __init__(
         self,
         data_path: Path,
-        h5py_folder: str,
         challenge: str,
         train_transform: Callable,
         val_transform: Callable,
@@ -101,50 +98,31 @@ class CmrxReconDataModule(pl.LightningDataModule):
     ):
         """
         Args:
-            data_path: Path to root data directory. For example, if knee/path
-                is the root directory with subdirectories multicoil_train and
-                multicoil_val, you would input knee/path for data_path.
-            challenge: Name of challenge from ('multicoil', 'singlecoil').
-            train_transform: A transform object for the training split.
-            val_transform: A transform object for the validation split.
-            combine_train_val: Whether to combine train and val splits into one
-                large train dataset. Use this for leaderboard submission.
+            data_path: Path to the root data directory.
+            challenge: Type of challenge, 'multicoil' or 'singlecoil'.
+            train_transform: Transform function applied to the training data.
+            val_transform: Transform function applied to the validation data.
+            combine_train_val: Whether to combine train and val splits into one dataset.
             sample_rate: Fraction of slices of the training data split to use.
-                Can be set to less than 1.0 for rapid prototyping. If not set,
-                it defaults to 1.0. To subsample the dataset either set
-                sample_rate (sample by slice) or volume_sample_rate (sample by
-                volume), but not both.
-            val_sample_rate: Same as sample_rate, but for val split.
-            volume_sample_rate: Fraction of volumes of the training data split
-                to use. Can be set to less than 1.0 for rapid prototyping. If
-                not set, it defaults to 1.0. To subsample the dataset either
-                set sample_rate (sample by slice) or volume_sample_rate (sample
-                by volume), but not both.
-            val_volume_sample_rate: Same as volume_sample_rate, but for val
-                split.
-            train_filter: A callable which takes as input a training example
-                metadata, and returns whether it should be part of the training
-                dataset.
-            val_filter: Same as train_filter, but for val split.
-            use_dataset_cache_file: Whether to cache dataset metadata. This is
-                very useful for large datasets like the brain data.
-            batch_size: Batch size.
-            num_workers: Number of workers for PyTorch dataloader.
-            distributed_sampler: Whether to use a distributed sampler. This
-                should be set to True if training with ddp.
+            val_sample_rate: Fraction of slices of the validation data split to use.
+            volume_sample_rate: Fraction of volumes of the training data split to use.
+            val_volume_sample_rate: Fraction of volumes of the validation data split to use.
+            train_filter: Optional filter for training data.
+            val_filter: Optional filter for validation data.
+            use_dataset_cache_file: Whether to cache dataset metadata.
+            batch_size: Batch size for data loaders.
+            num_workers: Number of workers for data loaders.
+            distributed_sampler: Whether to use a distributed sampler (for DDP).
         """
         super().__init__()
 
         if _check_both_not_none(sample_rate, volume_sample_rate):
-            raise ValueError("Can set sample_rate or volume_sample_rate, but not both.")
+            raise ValueError("Cannot set both sample_rate and volume_sample_rate.")
         if _check_both_not_none(val_sample_rate, val_volume_sample_rate):
-            raise ValueError(
-                "Can set val_sample_rate or val_volume_sample_rate, but not both."
-            )
+            raise ValueError("Cannot set both val_sample_rate and val_volume_sample_rate.")
 
-        # NOTE: Our datapath leads to the the Multicoil directory which contains all our modalities
+        # Store initialization parameters
         self.data_path = data_path
-        
         self.challenge = challenge
         self.train_transform = train_transform
         self.val_transform = val_transform
@@ -167,43 +145,49 @@ class CmrxReconDataModule(pl.LightningDataModule):
         sample_rate: Optional[float] = None,
         volume_sample_rate: Optional[float] = None,
     ) -> torch.utils.data.DataLoader:
+        """
+        Create a PyTorch DataLoader for a given data partition (train/val).
+
+        Args:
+            data_transform: Transform function applied to the data.
+            data_partition: Which data partition to load ('train', 'val').
+            sample_rate: Fraction of slices to load (for sampling).
+            volume_sample_rate: Fraction of volumes to load (for volume sampling).
+
+        Returns:
+            A PyTorch DataLoader instance.
+        """
         if data_partition == "train":
             is_train = True
             sample_rate = self.sample_rate if sample_rate is None else sample_rate
             volume_sample_rate = (
-                self.volume_sample_rate
-                if volume_sample_rate is None
-                else volume_sample_rate
+                self.volume_sample_rate if volume_sample_rate is None else volume_sample_rate
             )
             raw_sample_filter = self.train_filter
         else:
             is_train = False
-            if data_partition == "val":
-                sample_rate = (
-                    self.val_sample_rate if sample_rate is None else sample_rate
-                )
-                volume_sample_rate = (
-                    self.val_volume_sample_rate
-                    if volume_sample_rate is None
-                    else volume_sample_rate
-                )
-                raw_sample_filter = self.val_filter
+            sample_rate = (
+                self.val_sample_rate if sample_rate is None else sample_rate
+            )
+            volume_sample_rate = (
+                self.val_volume_sample_rate if volume_sample_rate is None else volume_sample_rate
+            )
+            raw_sample_filter = self.val_filter
 
-        # if desired, combine train and val together for the train split
-        dataset: Union[CmrxReconSliceDataset2024, CombinedCmrxReconSliceDataset2024]
+        # Combine train and val data if specified
         if is_train and self.combine_train_val:
-            data_partitions = [
-                "train",
-                "val"
-            ]
+            data_partitions = ["train", "val"]
             data_paths = [self.data_path, self.data_path]
             data_transforms = [data_transform, data_transform]
             challenges = [self.challenge, self.challenge]
-            sample_rates, volume_sample_rates = None, None  # default: no subsampling
+
+            # Prepare sampling rates for combined dataset
+            sample_rates, volume_sample_rates = None, None
             if sample_rate is not None:
                 sample_rates = [sample_rate, sample_rate]
             if volume_sample_rate is not None:
                 volume_sample_rates = [volume_sample_rate, volume_sample_rate]
+
             dataset = CombinedCmrxReconSliceDataset2024(
                 roots=data_paths,
                 transforms=data_transforms,
@@ -214,9 +198,9 @@ class CmrxReconDataModule(pl.LightningDataModule):
                 raw_sample_filter=raw_sample_filter,
                 data_partitions=data_partitions
             )
-
         else:
-            data_path = self.data_path 
+            # Load specific data partition (train or val)
+            data_path = self.data_path
 
             dataset = CmrxReconSliceDataset2024(
                 root=data_path,
@@ -229,16 +213,16 @@ class CmrxReconDataModule(pl.LightningDataModule):
                 raw_sample_filter=raw_sample_filter,
             )
 
-        # ensure that entire volumes go to the same GPU in the ddp setting
+        # Handle data shuffling and distributed sampling
         sampler = None
-
         if self.distributed_sampler:
             if is_train:
                 sampler = torch.utils.data.DistributedSampler(dataset)
             else:
                 sampler = fastmri.data.VolumeSampler(dataset, shuffle=False)
 
-        dataloader = torch.utils.data.DataLoader(
+        # Return the configured DataLoader
+        return torch.utils.data.DataLoader(
             dataset=dataset,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
@@ -247,127 +231,105 @@ class CmrxReconDataModule(pl.LightningDataModule):
             shuffle=is_train if sampler is None else False,
         )
 
-        return dataloader
-
     def prepare_data(self):
-        # call dataset for each split one time to make sure the cache is set up on the
-        # rank 0 ddp process. if not using cache, don't do this
+        """
+        Prepare data by initializing the dataset to ensure cache setup.
+        This method is used to make sure the dataset is cached on rank 0 DDP process.
+        """
         if self.use_dataset_cache_file:
-            data_paths = [
-                self.data_path / "train",# / f"{self.challenge}_train",
-                self.data_path / "val", # / f"{self.challenge}_val",
-            ]
-            data_transforms = [
-                self.train_transform,
-                self.val_transform,
-            ]
-            for i, (data_path, data_transform) in enumerate(
-                zip(data_paths, data_transforms)
-            ):
-                # NOTE: Fixed so that val and test use correct sample rates
-                sample_rate = self.sample_rate  # if i == 0 else 1.0
-                volume_sample_rate = self.volume_sample_rate  # if i == 0 else None
-                data_partition = data_path.relative_to(self.data_path) # separates the data_partition without leading /
-                _ = CmrxReconSliceDataset2024(
-                    root=data_path,
-                    challenge=self.challenge,
-                    data_partition=data_partition,
-                    transform=data_transform,
-                    sample_rate=sample_rate,
-                    volume_sample_rate=volume_sample_rate,
-                    use_dataset_cache=self.use_dataset_cache_file
-                )
+            data_partitions = ["train", "val"]
+            data_type_list = ['Aorta', 'Cine', 'Mapping', 'Tagging']
+
+            for data_partition in data_partitions:
+                for data_type in data_type_list:
+                    data_path = os.path.join(self.data_path, data_type, 'TrainingSet', 'h5_FullSample', data_partition)
+                    
+                    # Initialize the dataset to ensure cache setup
+                    _ = CmrxReconSliceDataset2024(
+                        root=data_path,
+                        challenge=self.challenge,
+                        data_partition=data_partition,
+                        transform=self.train_transform if data_partition == "train" else self.val_transform,
+                        sample_rate=self.sample_rate,
+                        volume_sample_rate=self.volume_sample_rate,
+                        use_dataset_cache=self.use_dataset_cache_file
+                    )
 
     def train_dataloader(self):
+        """Return DataLoader for training data."""
         return self._create_data_loader(self.train_transform, data_partition="train")
 
     def val_dataloader(self):
+        """Return DataLoader for validation data."""
         return self._create_data_loader(self.val_transform, data_partition="val")
 
     @staticmethod
     def add_data_specific_args(parent_parser):  # pragma: no-cover
         """
-        Define parameters that only apply to this model
+        Define parameters that are specific to this data module.
+        These arguments will be added to the main argument parser.
         """
         parser = ArgumentParser(parents=[parent_parser], add_help=False)
 
-        # dataset arguments
+        # Dataset-related arguments
         parser.add_argument(
             "--data_path",
             default=None,
             type=Path,
-            help="Path to fastMRI data root",
-        )
-        parser.add_argument(
-            "--h5py_folder",
-            default=None,
-            type=str,
-            help="Folder name for converted h5py files",
+            help="Path to the root data directory.",
         )
         parser.add_argument(
             "--challenge",
             choices=("singlecoil", "multicoil"),
             default="multicoil",
             type=str,
-            help="Which challenge to preprocess for",
+            help="Which challenge type to preprocess data for.",
         )
         parser.add_argument(
             "--sample_rate",
             default=None,
             type=float,
-            help=(
-                "Fraction of slices in the dataset to use (train split only). If not "
-                "given all will be used. Cannot set together with volume_sample_rate."
-            ),
+            help="Fraction of slices to use for training (between 0 and 1).",
         )
         parser.add_argument(
             "--val_sample_rate",
             default=None,
             type=float,
-            help=(
-                "Fraction of slices in the dataset to use (val split only). If not "
-                "given all will be used. Cannot set together with volume_sample_rate."
-            ),
+            help="Fraction of slices to use for validation (between 0 and 1).",
         )
         parser.add_argument(
             "--volume_sample_rate",
             default=None,
             type=float,
-            help=(
-                "Fraction of volumes of the dataset to use (train split only). If not "
-                "given all will be used. Cannot set together with sample_rate."
-            ),
+            help="Fraction of volumes to use for training (between 0 and 1).",
         )
         parser.add_argument(
             "--val_volume_sample_rate",
             default=None,
             type=float,
-            help=(
-                "Fraction of volumes of the dataset to use (val split only). If not "
-                "given all will be used. Cannot set together with val_sample_rate."
-            ),
+            help="Fraction of volumes to use for validation (between 0 and 1).",
         )
         parser.add_argument(
             "--use_dataset_cache_file",
             default=True,
             type=bool,
-            help="Whether to cache dataset metadata in a pkl file",
+            help="Whether to cache dataset metadata in a pickle file.",
         )
         parser.add_argument(
             "--combine_train_val",
             action="store_true",
-            help="Whether to combine train and val splits for training",
+            help="Whether to combine train and validation datasets for training.",
         )
 
-        # data loader arguments
+        # DataLoader-related arguments
         parser.add_argument(
-            "--batch_size", default=1, type=int, help="Data loader batch size"
+            "--batch_size", default=1, type=int, help="Batch size for DataLoader."
         )
         parser.add_argument(
             "--num_workers",
             default=4,
             type=int,
-            help="Number of workers to use in data loader",
+            help="Number of workers for DataLoader.",
         )
 
         return parser

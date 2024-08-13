@@ -4,10 +4,9 @@ from torch import nn
 from argparse import ArgumentParser
 from fastmri.data import transforms
 from fastmri.pl_modules import MriModule
-from models import ReconModel
+from ..model.model import ReconModel
 
 class ReconMRIModule(MriModule):
-    
     def __init__(
         self,
         lr: float = 0.0003,
