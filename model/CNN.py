@@ -1,9 +1,10 @@
+# -*- coding: utf-8 -*-
 """
 Oct 12, 2021
 Combined and modified by Kaicong Sun <sunkc@shanghaitech.edu.cn>
 
-Jul 23, 2024
-Extended by Nicolas Carpenter <ngcarpen@ualberta.ca>
+2024
+Extended to 3D by Nicolas Carpenter <ngcarpen@ualberta.ca>
 """
 
 import math
@@ -11,21 +12,23 @@ from typing import List, Tuple, Optional
 import torch
 from torch import nn
 from torch.nn import functional as F
-import utils
+from model import utils
 
 #########################################################################################################
 # 3D UNet
 #########################################################################################################
 
-class Unet3D(nn.Module):
+class UNet3D(nn.Module):
     """
-    PyTorch implementation of a U-Net model for 2D+t data.
+    PyTorch implementation of a 3D U-Net model from "3D U-Net: Learning Dense Volumetric Segmentation from Sparse Annotation"
+        - authours: Özgün Çiçek, Ahmed Abdulkadir, Soeren S. Lienkamp, Thomas Brox, Olaf Ronneberger
+        - arXiv:1606.06650
     """
 
     def __init__(
         self,
-        in_chans: int,
-        out_chans: int,
+        in_chans: int = 20,
+        out_chans: int = 20,
         chans: int = 16,  # 32
         num_pool_layers: int = 4,
     ):
@@ -40,78 +43,83 @@ class Unet3D(nn.Module):
 
         self.in_chans = in_chans
         self.out_chans = out_chans
-        self.chans = chans
         self.num_pool_layers = num_pool_layers
 
-        self.down_sample_layers = nn.ModuleList([ConvBlock3D(in_chans, chans)])
+        # Initialize the downsampling path
+        self.down_sample_layers = nn.ModuleList([ConvBlock3D(self.in_chans, chans)])
+
         ch = chans
-        for _ in range(num_pool_layers - 1):
+
+        for _ in range(self.num_pool_layers - 1):
             self.down_sample_layers.append(ConvBlock3D(ch, ch * 2))
             ch *= 2
-        self.conv = ConvBlock3D(ch, ch * 2)
 
-        self.up_conv = nn.ModuleList()
-        self.upsampling_conv = nn.ModuleList()
+        # Bottleneck layer
+        self.bottleneck = ConvBlock3D(ch, ch * 2)
 
-        for _ in range(num_pool_layers - 1):
-            self.upsampling_conv.append(TransposeConvBlock3D(ch * 2, ch))
-            self.up_conv.append(ConvBlock3D(ch * 2, ch))
+        # Initialize the upsampling path
+        self.up_sample_layers = nn.ModuleList()
+        self.up_conv_layers = nn.ModuleList()
+
+        for _ in range(self.num_pool_layers - 1):
+            self.up_sample_layers.append(TransposeConvBlock3D(ch * 2, ch))
+            self.up_conv_layers.append(ConvBlock3D(ch * 2, ch))
             ch //= 2
 
-        self.upsampling_conv.append(TransposeConvBlock3D(ch * 2, ch))
+        self.up_sample_layers.append(TransposeConvBlock3D(ch * 2, ch))
 
-        self.up_conv.append(
-            nn.Sequential(
-                ConvBlock3D(ch * 2, ch),
-                nn.Conv3d(ch, self.out_chans, kernel_size=1, stride=1),
-            )
-        )
+        self.output_layer = TransposeConvBlock3D(ch * 2, ch)
+        self.output_conv = nn.Conv3d(ch, self.out_chans, kernel_size=1, stride=1) 
 
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            image: Input 5D tensor of shape `(B, in_chans, T, H, W)`.
+            image: Input 5D tensor of shape `(B, C, T, X, Y)`.
 
         Returns:
-            Output tensor of shape `(B, out_chans, T, H, W)`.
+            Output tensor of shape `(B, out_chans, T, X, Y)`.
         """
-        assert not torch.is_complex(image)
+
         stack = []
         output = image
 
-        # apply down-sampling layers
+        # Downsampling path
         for layer in self.down_sample_layers:
             output = layer(output)
             stack.append(output)
-            output = F.avg_pool3d(output, kernel_size=(1, 2, 2), stride=(1, 2, 2), padding=0)
+            output = F.avg_pool3d(output, kernel_size=2, stride=2, padding=0)
 
-        output = self.conv(output)
+        # Bottleneck
+        output = self.bottleneck(output)
 
-        # apply up-sampling layers
-        for up_conv, conv in zip(self.upsampling_conv, self.up_conv):
+        # Upsampling path
+        for up_sample, up_conv in zip(self.up_sample_layers, self.up_conv_layers):
             downsample_layer = stack.pop()
+            output = up_sample(output)
 
-            output = up_conv(output)
-            output = F.interpolate(output, scale_factor=(1, 2, 2))
-
-            # reflect pad on the right/bottom if needed to handle odd input dimensions
             padding = [0, 0, 0, 0, 0, 0]
-            if output.shape[-1] != downsample_layer.shape[-1]:
-                padding[1] = 1  # padding right
-            if output.shape[-2] != downsample_layer.shape[-2]:
-                padding[3] = 1  # padding bottom
-            if torch.sum(torch.tensor(padding)) != 0:
+            if output.shape[-1] != downsample_layer.shape[-1]:  # Y dimension
+                padding[0] = 1  # padding right (Y dimension)
+            if output.shape[-2] != downsample_layer.shape[-2]:  # X dimension
+                padding[2] = 1  # padding bottom (X dimension)
+            if output.shape[-3] != downsample_layer.shape[-3]:  # T dimension
+                padding[4] = 1  # padding in the temporal dimension
+
+            if any(padding):
                 output = F.pad(output, padding, "reflect")
 
             output = torch.cat([output, downsample_layer], dim=1)
-            output = conv(output)
+            output = up_conv(output)
+
+        output = self.output_layer(output)
+        output = self.output_conv(output)
 
         return output
+
 
 #########################################################################################################
 # 3D NormNet
 #########################################################################################################
-
 
 class NormNet3D(nn.Module):
     """
@@ -140,92 +148,92 @@ class NormNet3D(nn.Module):
         """
         super().__init__()
 
-        self.NormNet3D = Unet3D(
+        self.NormNet3D = UNet3D(
             in_chans=in_chans,
             out_chans=out_chans,
             chans=chans,  # 32
             num_pool_layers=num_pool_layers
         )
 
-    def complex_to_chan_dim(self, x: torch.Tensor) -> torch.Tensor:
-        assert torch.is_complex(x)
-        return torch.cat([x.real, x.imag], dim=1)
+    def complex_to_chan_dim(self, image: torch.Tensor) -> torch.Tensor:
+        assert torch.is_complex(image)
+        return torch.cat([image.real, image.imag], dim=1)
 
-    def chan_dim_to_complex(self, x: torch.Tensor) -> torch.Tensor:
-        assert not torch.is_complex(x)
-        _, c, _, _, _ = x.shape
-        assert c % 2 == 0
-        c = c // 2
-        return torch.complex(x[:, :c], x[:, c:])
+    def chan_dim_to_complex(self, image: torch.Tensor) -> torch.Tensor:
+        assert not torch.is_complex(image)
+        _, C, _, _, _ = image.shape
+        assert C % 2 == 0
+        C = C // 2
+        return torch.complex(image[:, :C], image[:, C:])
 
-    def norm(self, x: torch.Tensor):
+    def norm(self, image: torch.Tensor):
         # group norm
-        b, c, t, h, w = x.shape
-        assert c % 2 == 0
-        x = x.view(b, 2, c // 2 * t * h * w)
+        B, C, T, X, Y = image.shape
+        assert C % 2 == 0
+        image = image.view(B, 2, C // 2 * T * X * Y)
 
-        mean = x.mean(dim=2).view(b, 2, 1)
-        std = x.std(dim=2).view(b, 2, 1)
+        mean = image.mean(dim=2).view(B, 2, 1)
+        std = image.std(dim=2).view(B, 2, 1)
 
-        x = (x - mean) / (std + 1e-12)
+        image = (image - mean) / (std + 1e-12)
 
-        return x.view(b, c, t, h, w), mean, std
+        return image.view(B, C, T, X, Y), mean, std
 
-    def unnorm(self, x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor):
-        b, c, t, h, w = x.shape
-        assert c % 2 == 0
-        x = x.contiguous().view(b, 2, c // 2 * t * h * w)
-        x = x * std + mean
-        return x.view(b, c, t, h, w)
+    def unnorm(self, image: torch.Tensor, mean: torch.Tensor, std: torch.Tensor):
+        B, C, T, X, Y = image.shape
+        assert C % 2 == 0
+        image = image.contiguous().view(B, 2, C // 2 * T * X * Y)
+        image = image * std + mean
+        return image.view(B, C, T, X, Y)
 
     def pad(
-        self, x: torch.Tensor
+        self, image: torch.Tensor
     ) -> Tuple[torch.Tensor, Tuple[List[int], List[int], List[int], int, int, int]]:
-        _, _, t, h, w = x.shape
-        t_mult = ((t - 1) | 15) + 1
-        w_mult = ((w - 1) | 15) + 1
-        h_mult = ((h - 1) | 15) + 1
-        t_pad = [math.floor((t_mult - t) / 2), math.ceil((t_mult - t) / 2)]
-        w_pad = [math.floor((w_mult - w) / 2), math.ceil((w_mult - w) / 2)]
-        h_pad = [math.floor((h_mult - h) / 2), math.ceil((h_mult - h) / 2)]
-        x = F.pad(x, t_pad + w_pad + h_pad)
+        _, _, T, X, Y = image.shape
+        T_mult = ((T - 1) | 15) + 1
+        X_mult = ((X - 1) | 15) + 1
+        Y_mult = ((Y - 1) | 15) + 1
+        T_pad = [math.floor((T_mult - T) / 2), math.ceil((T_mult - T) / 2)]
+        X_pad = [math.floor((X_mult - X) / 2), math.ceil((X_mult - X) / 2)]
+        Y_pad = [math.floor((Y_mult - Y) / 2), math.ceil((Y_mult - Y) / 2)]
+        image = F.pad(image, Y_pad + X_pad + T_pad)
 
-        return x, (t_pad, h_pad, w_pad, t_mult, h_mult, w_mult)
+        return image, (T_pad, X_pad, Y_pad, T_mult, X_mult, Y_mult)
 
     def unpad(
         self,
-        x: torch.Tensor,
-        t_pad: List[int],
-        h_pad: List[int],
-        w_pad: List[int],
-        t_mult: int,
-        h_mult: int,
-        w_mult: int,
+        image: torch.Tensor,
+        T_pad: List[int],
+        X_pad: List[int],
+        Y_pad: List[int],
+        T_mult: int,
+        X_mult: int,
+        Y_mult: int,
     ) -> torch.Tensor:
-        return x[..., t_pad[0]: t_mult - t_pad[1], h_pad[0]: h_mult - h_pad[1], w_pad[0]: w_mult - w_pad[1]]
+        return image[..., T_pad[0]: T_mult - T_pad[1], X_pad[0]: X_mult - X_pad[1], Y_pad[0]: Y_mult - Y_pad[1]]
 
     def forward(
         self,
-        x: torch.Tensor,
+        image: torch.Tensor,
         ref: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        assert len(x.shape) == 5
+        assert len(image.shape) == 5
 
         # get shapes for unet and normalize
-        x, mean, std = self.norm(x)
-        x, pad_sizes = self.pad(x)
+        image, mean, std = self.norm(image)
+        image, pad_sizes = self.pad(image)
 
         #### standard ####
-        x = self.NormNet3D(x)
+        image = self.NormNet3D(image)
 
         # get shapes back and unnormalize
-        x = self.unpad(x, *pad_sizes)
-        x = self.unnorm(x, mean, std)
+        image = self.unpad(image, *pad_sizes)
+        image = self.unnorm(image, mean, std)
 
-        return x
+        return image
 
 #########################################################################################################
-# 3D Covolution 
+# 3D Convolution 
 #########################################################################################################
 
 class ConvBlock3D(nn.Module):
@@ -246,7 +254,7 @@ class ConvBlock3D(nn.Module):
         self.out_chans = out_chans
 
         self.layers = nn.Sequential(
-            nn.Conv3d(in_chans, out_chans, kernel_size=3, padding=1, bias=False),
+            nn.Conv3d(in_chans, out_chans, kernel_size=3, stride=1, padding=1, bias=False),
             nn.InstanceNorm3d(out_chans),
             nn.LeakyReLU(negative_slope=0.2, inplace=True)
         )
@@ -254,10 +262,10 @@ class ConvBlock3D(nn.Module):
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            image: Input 5D tensor of shape `(B, in_chans, T, H, W)`.
+            image: Input 5D tensor of shape `(B, in_chans, T, X, Y)`.
 
         Returns:
-            Output tensor of shape `(B, out_chans, T, H, W)`.
+            Output tensor of shape `(B, out_chans, T, X, Y)`.
         """
         return self.layers(image)
 
@@ -297,79 +305,15 @@ class GatedConvBlock3D(nn.Module):
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            image: Input 5D tensor of shape `(B, in_chans, T, H, W)`.
+            image: Input 5D tensor of shape `(B, C, T, X, Y)`.
 
         Returns:
-            Output tensor of shape `(B, out_chans, T, H, W)`.
+            Output tensor of shape `(B, out_chans, T, X, Y)`.
         """
         x_img = self.layers(image)
         x_gate = self.gatedlayers(image)
         x = x_img * x_gate
         return x
-
-#########################################################################################################
-# 3D SM Convolution w/ Spatial Attention
-#########################################################################################################
-
-class ConvBlockSM3D(nn.Module):
-    """
-    A Convolutional Block that consists of convolution layers each followed by
-    instance normalization, LeakyReLU activation, and spatiotemporal attention.
-    """
-
-    def __init__(self, in_chans=2, conv_num=0, out_chans=None, max_chans=None):
-        """
-        Args:
-            in_chans: Number of channels in the input.
-            out_chans: Number of channels in the output.
-        """
-        super().__init__()
-
-        self.in_chans = in_chans
-        self.chans_max = max_chans or in_chans
-        self.out_chans = out_chans or in_chans
-
-        self.layers = []
-        self.layers.append(nn.Sequential(
-            nn.Conv3d(self.in_chans, self.chans_max, kernel_size=3, padding=1, bias=False),
-            nn.InstanceNorm3d(self.chans_max),
-            nn.LeakyReLU(negative_slope=0.2, inplace=True)
-        ))
-
-        #### Spatiotemporal Attention ####
-        self.STA = utils.SpatiotemporalAttention(in_channels=self.chans_max)
-
-        for index in range(conv_num):
-            if index == conv_num - 1:
-                self.layers.append(nn.Sequential(
-                    nn.Conv3d(self.chans_max, self.out_chans, kernel_size=3, padding=1, bias=False),
-                    nn.InstanceNorm3d(self.in_chans),
-                    nn.LeakyReLU(negative_slope=0.2, inplace=True)
-                ))
-            else:
-                self.layers.append(nn.Sequential(
-                    nn.Conv3d(self.chans_max, self.chans_max, kernel_size=3, padding=1, bias=False),
-                    nn.InstanceNorm3d(self.chans_max),
-                    nn.LeakyReLU(negative_slope=0.2, inplace=True)
-                ))
-
-        self.body = nn.Sequential(*self.layers)
-
-    def forward(self, image: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            image: Input 5D tensor of shape `(B, in_chans, T, H, W)`.
-
-        Returns:
-            Output tensor of shape `(B, out_chans, T, H, W)`.
-        """
-        output = self.body(image)
-        output = output + image[:, :2, :, :, :]
-        
-        #### Spatiotemporal Attention ###
-        output = self.STA(output) * output
-
-        return output
 
 
 #########################################################################################################
@@ -394,9 +338,7 @@ class TransposeConvBlock3D(nn.Module):
         self.out_chans = out_chans
 
         self.layers = nn.Sequential(
-            nn.ConvTranspose3d(
-                in_chans, out_chans, kernel_size=(1, 2, 2), stride=(1, 2, 2), bias=False
-            ),
+            nn.ConvTranspose3d(in_chans, out_chans, kernel_size=3, stride=2, padding=1, output_padding=1, bias=False),
             nn.InstanceNorm3d(out_chans),
             nn.LeakyReLU(negative_slope=0.2, inplace=True),
         )
@@ -404,9 +346,9 @@ class TransposeConvBlock3D(nn.Module):
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            image: Input 5D tensor of shape `(B, in_chans, T, H, W)`.
+            image: Input 5D tensor of shape `(B, C, T, X, Y)`.
 
         Returns:
-            Output tensor of shape `(B, out_chans, T, H*2, W*2)`.
+            Output tensor of shape `(B, out_chans, T*2, X*2, Y*2)`.
         """
         return self.layers(image)

@@ -12,7 +12,7 @@ import torch
 import os
 
 import fastmri
-from ..data_utils.mri_datasets import CombinedCmrxReconSliceDataset2024, CmrxReconSliceDataset2024
+from data_utils.mri_datasets import CombinedCmrxReconSliceDataset2024, CmrxReconSliceDataset2024
 
 def worker_init_fn(worker_id):
     """Handle random seeding for all mask_func."""
@@ -64,7 +64,6 @@ def _check_both_not_none(val1, val2):
     """Check if both values are not None. Used to ensure mutually exclusive arguments."""
     if (val1 is not None) and (val2 is not None):
         return True
-
     return False
 
 class CmrxReconDataModule(pl.LightningDataModule):
@@ -212,6 +211,7 @@ class CmrxReconDataModule(pl.LightningDataModule):
                 volume_sample_rate=volume_sample_rate,
                 raw_sample_filter=raw_sample_filter,
             )
+        
 
         # Handle data shuffling and distributed sampling
         sampler = None
@@ -221,14 +221,17 @@ class CmrxReconDataModule(pl.LightningDataModule):
             else:
                 sampler = fastmri.data.VolumeSampler(dataset, shuffle=False)
 
+        
+        print(f"Length of {data_partition} dataset: {len(dataset)}")
+
         # Return the configured DataLoader
         return torch.utils.data.DataLoader(
             dataset=dataset,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
-            worker_init_fn=worker_init_fn,
             sampler=sampler,
             shuffle=is_train if sampler is None else False,
+            pin_memory=True,  # Recommended if you're using a GPU
         )
 
     def prepare_data(self):
@@ -238,22 +241,19 @@ class CmrxReconDataModule(pl.LightningDataModule):
         """
         if self.use_dataset_cache_file:
             data_partitions = ["train", "val"]
-            data_type_list = ['Aorta', 'Cine', 'Mapping', 'Tagging']
 
             for data_partition in data_partitions:
-                for data_type in data_type_list:
-                    data_path = os.path.join(self.data_path, data_type, 'TrainingSet', 'h5_FullSample', data_partition)
-                    
-                    # Initialize the dataset to ensure cache setup
-                    _ = CmrxReconSliceDataset2024(
-                        root=data_path,
-                        challenge=self.challenge,
-                        data_partition=data_partition,
-                        transform=self.train_transform if data_partition == "train" else self.val_transform,
-                        sample_rate=self.sample_rate,
-                        volume_sample_rate=self.volume_sample_rate,
-                        use_dataset_cache=self.use_dataset_cache_file
-                    )
+                # Use the base path without modification
+                _ = CmrxReconSliceDataset2024(
+                    root=self.data_path,  # Use the base path directly
+                    challenge=self.challenge,
+                    data_partition=data_partition,
+                    transform=self.train_transform if data_partition == "train" else self.val_transform,
+                    sample_rate=self.sample_rate,
+                    volume_sample_rate=self.volume_sample_rate,
+                    use_dataset_cache=self.use_dataset_cache_file
+                )
+
 
     def train_dataloader(self):
         """Return DataLoader for training data."""

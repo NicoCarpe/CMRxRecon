@@ -2,151 +2,177 @@
 """
 @author: sunkg
 
-Jul 25, 2024
-Extended by Nicolas Carpenter <ngcarpen@ualberta.ca>
+Jul 23, 2024
+Modified by Nicolas Carpenter <ngcarpen@ualberta.ca>
 """
+import time
 import torch
-import torch.fft
-import torch.nn.functional as F
-from basemodel import BaseModel
-import metrics
 import torch.nn as nn
-import fD2RT3D
-from utils import rss, fft2, ifft2, ssimloss
-import utils
-import numpy as np
+from model import SwinUNet3D_no_cyclic, SM_models, utils
+from einops import rearrange
+import torch.utils.checkpoint as cp
 
-def generate_rhos(num_recurrent):
-    rhos = [0.85 ** i for i in range(num_recurrent - 1, -1, -1)]
-    return rhos
 
-# Modified TV loss to consider smoothness in the temporal dimension as well as the spatial dimensions 
-def TV_loss(img, weight):
-    bs_img, t_img, c_img, h_img, w_img = img.size()
-    tv_t = torch.pow(img[:, 1:, :, :, :] - img[:, :-1, :, :, :], 2).sum()
-    tv_h = torch.pow(img[:, :, :, 1:, :] - img[:, :, :, :-1, :], 2).sum()
-    tv_w = torch.pow(img[:, :, :, :, 1:] - img[:, :, :, :, :-1], 2).sum()
-    return (weight * (tv_h + tv_w + tv_t)) / (bs_img * t_img * c_img * h_img * w_img)
+class IRB(nn.Module):
+    def __init__(self, coils_all, num_heads, window_size, depths, embed_dim, drop=0., scale=0.1):
+        super().__init__()
 
-class ReconModel(BaseModel):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        
+        self.LeakyReLU = nn.LeakyReLU()
+        self.coils_all = coils_all
+        self.scale = scale
 
-        self.rhos = generate_rhos(self.cfg.num_recurrent)
-        self.device = self.cfg.device
-       
-        self.net_R = fD2RT3D.fD2RT3D(
-                        coils=self.cfg.coils,
-                        num_heads=self.cfg.num_heads, 
-                        window_size=self.cfg.window_size, 
-                        depths=self.cfg.depths, 
-                        patch_size=self.cfg.patch_size, 
-                        embed_dim=self.cfg.embed_dim, 
-                        mlp_ratio=self.cfg.mlp_ratio, 
-                        qkv_bias=True, 
-                        qk_scale=None, 
-                        drop=0., 
-                        attn_drop=0., 
-                        drop_path=0., 
-                        norm_layer=nn.LayerNorm, 
-                        n_SC=self.cfg.n_SC, 
-                        num_recurrent=self.cfg.num_recurrent, 
-                        sens_chans=self.cfg.sens_chans, 
-                        sens_steps=self.cfg.sens_steps, 
-                        ds_ref=self.cfg.ds_ref
-                    ).to(self.device)
+        # Initialize SwinTransformer3D for image processing
+        self.SwinTransformer3D = SwinUNet3D_no_cyclic.SwinUnet3D(
+            hidden_dim=embed_dim,
+            layers=depths,
+            heads=num_heads,
+            in_channel=2,  # Assuming your input has 2 channels (e.g., real and imaginary)
+            num_classes=2,  # Assuming 2 output channels/classes
+            head_dim=32,
+            window_size=window_size, 
+            downscaling_factors=(2, 2, 2, 2),
+            relative_pos_embedding=True,
+            dropout=drop,
+            skip_style='stack',
+            stl_channels=32
+        )
 
-    def set_input_noGT(self, masked_kspace, mask):
-        B, T, C, H, W = masked_kspace.shape
-        self.Target_f_rss = torch.zeros([B, T, 1, H, W], dtype=torch.complex64)
-        self.Target_Kspace_f = torch.zeros([B, T, C, H, W], dtype=torch.complex64)
-        self.Target_Kspace_sampled = masked_kspace
-        self.Target_sampled_rss = rss(ifft2(self.Target_Kspace_sampled))
-        self.mask_tar = mask
+    def forward(self, Target_Kspace_u, Target_img_f, mask, sens_maps_updated, idx, gate, stepsize):
+        Target_img_f.requires_grad_(True)
 
-    def set_input_GT(self, masked_kspace, mask, target):
-        self.Target_f_rss = rss(target)
-        self.Target_Kspace_f = fft2(target)
-        self.mask_tar = mask
-        self.Target_Kspace_sampled = self.Target_Kspace_f * self.mask_tar
-        self.Target_sampled_rss = rss(ifft2(self.Target_Kspace_sampled))
+        # Convert to channel dimension representation
+        Target_img_f = utils.complex_to_chan_dim(Target_img_f)
 
-    def forward(self, masked_kspace, mask, num_low_frequencies, max_img_size, target=None):
-        if target is not None:
-            self.set_input_GT(masked_kspace, mask, target)
+        # SwinTransformer3D forward pass
+        output_SwinTransformer3D = self.SwinTransformer3D(Target_img_f)
+
+        # Convert back to complex values
+        output_SwinTransformer3D = utils.chan_dim_to_complex(output_SwinTransformer3D)
+
+        Target_img_f = utils.chan_dim_to_complex(Target_img_f)
+
+        # Gradient update of the image
+        Target_img_f = Target_img_f - stepsize * (2 * utils.sens_reduce(mask * (mask * utils.sens_expand(Target_img_f, sens_maps_updated) - Target_Kspace_u), sens_maps_updated) + self.scale * output_SwinTransformer3D)  
+
+        return Target_img_f
+
+class ReconModel(nn.Module): 
+    def __init__(self, coils, num_heads, window_size, depths, embed_dim,
+                 drop=0., num_recurrent=5, sens_chans=8, sens_steps=4, 
+                 mask_center=True, scale=0.1):
+        super().__init__()
+
+        # Initialize sensitivity map network
+        self.SMEB3D = SM_models.SMEB3D(
+            chans=sens_chans,
+            sens_steps=sens_steps,
+            mask_center=mask_center
+        )
+
+        self.scale = scale
+        self.coils = coils
+        self.stepsize = nn.Parameter(0.1 * torch.rand(1))
+        self.num_recurrent = num_recurrent
+        # Initialize recurrent blocks (DDRB)
+        self.recurrent = nn.ModuleList([IRB(coils_all=coils,
+                                             num_heads=num_heads, 
+                                             window_size=window_size, 
+                                             depths=depths, 
+                                             embed_dim=embed_dim, 
+                                             drop=drop,
+                                             scale=scale,
+                                            ) 
+                                        for _ in range(num_recurrent)])
+
+        # Initialize convolution blocks for sensitivity map refinement
+        self.ConvBlockSM3D = nn.ModuleList([SM_models.ConvBlockSM2D_t(in_chans=2, conv_num=2) for _ in range(num_recurrent - 1)])
+
+    def SMRB3D(self, Target_img_f, sens_maps_updated, Target_Kspace_u, mask, gate, idx, stepsize):
+        """
+        Sensitivity map refinement block (SMRB).
+        Args:
+            Target_img_f: Target image in frequency domain.
+            sens_maps_updated: Updated sensitivity maps.
+            Target_Kspace_u: Undersampled K-space data.
+            mask: K-space mask.
+            gate: Gating parameter.
+            idx: Index of the current recurrent block.
+        Returns:
+            Updated sensitivity maps.
+        """
+        sens_maps_updated.requires_grad_(True)
+
+        Target_Kspace_f = utils.sens_expand(Target_img_f, sens_maps_updated)
+        B, C, T, X, Y = sens_maps_updated.shape
+
+        # Reshape and apply convolution
+        sens_maps_updated_ = sens_maps_updated.reshape(B * C, 1, T, X, Y)
+        sens_maps_updated_ = utils.complex_to_chan_dim(sens_maps_updated_)
+        # use checkpointing for heavy computation 
+        sens_maps_updated_ = self.ConvBlockSM3D[idx](sens_maps_updated_)
+        sens_maps_updated_ = utils.chan_dim_to_complex(sens_maps_updated_)
+        sens_maps_updated_ = sens_maps_updated_.reshape(B, C, T, X, Y)
+
+        # Sensitivity map update
+        sens_maps_updated = sens_maps_updated - stepsize * (
+            2 * utils.ifft2(mask * (mask * Target_Kspace_f - Target_Kspace_u) * Target_img_f.conj()) + 
+            self.scale * sens_maps_updated_
+        )
+        sens_maps_updated = sens_maps_updated / (utils.rss(sens_maps_updated) + 1e-12)
+        sens_maps_updated = sens_maps_updated * gate
+
+        return sens_maps_updated
+
+    def forward(self, Target_Kspace_u, mask, num_low_frequencies, max_img_size, attrs):
+        """
+        Forward pass for ReconModel.
+        Args:
+            Target_Kspace_u: Undersampled K-space data.
+            mask: K-space mask.
+            num_low_frequencies: Number of low-frequency components.
+            max_img_size: Maximum image size for padding.
+        Returns:
+            RSS images, sensitivity maps, and final image.
+        """
+
+        # NOTE: we applied model checkpointing to each of the networks in the IRB, SMEB, and SMRB
+        
+        # Initialize sensitivity maps with checkpointing
+        if self.coils == 1:
+            sens_maps_updated = torch.ones_like(Target_Kspace_u)
+            gate = torch.ones_like(sens_maps_updated).cuda()
         else:
-            self.set_input_noGT(masked_kspace, mask)
+            sens_maps_updated, gate = cp.checkpoint(self.SMEB3D, Target_Kspace_u, num_low_frequencies, max_img_size, use_reentrant=False)
 
-        with torch.cuda.amp.autocast(enabled=self.cfg.use_amp):
-            self.recs_complex, self.rec_rss, self.sens_maps, self.rec_img = self.net_R(
-                Target_Kspace_u=self.Target_Kspace_sampled,
-                mask=self.mask_tar,
-                num_low_frequencies=num_low_frequencies,
-                max_img_size=max_img_size
-            )
+        sens_maps_updated.requires_grad_(True)
 
-            # Loss computation
-            self.loss_all = 0
-            self.loss_fidelity = 0
-            self.local_fidelities = []
-            for i in range(self.cfg.num_recurrent):
-                loss_fidelity = F.l1_loss(rss(self.recs_complex[i]), self.Target_f_rss) + self.cfg.lambda0 * F.l1_loss(utils.sens_expand(self.recs_complex[i], self.sens_maps), self.Target_Kspace_f)
-                self.local_fidelities.append(self.rhos[i] * loss_fidelity)
-                self.loss_fidelity += self.local_fidelities[-1]
+        # Pad the input data to the maximum image size
+        Target_Kspace_u, orginial_size = utils.pad_to_max_size(Target_Kspace_u, max_img_size)
+        mask, _ = utils.pad_to_max_size(mask, max_img_size)
 
-            self.loss_all += self.loss_fidelity
-            self.loss_consistency = self.cfg.lambda1 * F.l1_loss(self.mask_tar * utils.sens_expand(self.rec_img, self.sens_maps), self.Target_Kspace_sampled)
-            self.loss_all += self.loss_consistency
-            self.loss_TV = TV_loss(torch.abs(self.sens_maps), self.cfg.lambda3)
-            self.loss_all += self.loss_TV
-            self.loss_ssim = self.cfg.lambda2 * ssimloss(self.rec_rss, self.Target_f_rss)
-            self.loss_all += self.loss_ssim
+        # Initialize target image
+        Target_img_f = utils.sens_reduce(Target_Kspace_u, sens_maps_updated)
+        Target_img_f.requires_grad_(True)
 
-        return self.local_fidelities, self.loss_fidelity, self.loss_consistency, self.loss_TV, self.loss_ssim, self.loss_all
-    
-    def test(self, Target_img_f):
-        assert not self.training
-        with torch.cuda.amp.autocast(enabled=self.cfg.use_amp):
-            with torch.no_grad():
-                self.forward(Target_img_f)
-                
-                self.metric_PSNR = metrics.psnr(self.Target_f_rss, self.rec_rss, self.cfg.GT)
-                self.metric_SSIM = metrics.ssim(self.Target_f_rss, self.rec_rss, self.cfg.GT)
-                self.metric_MAE = metrics.mae(self.Target_f_rss, self.rec_rss, self.cfg.GT)
-                self.metric_MSE = metrics.mse(self.Target_f_rss, self.rec_rss, self.cfg.GT)
-                self.metric_PSNR_raw = metrics.psnr(self.Target_f_rss, self.Target_sampled_rss, self.cfg.GT)
-                self.metric_SSIM_raw = metrics.ssim(self.Target_f_rss, self.Target_sampled_rss, self.cfg.GT)
-                
-                self.Eval = {
-                    'PSNR': self.metric_PSNR,
-                    'SSIM': self.metric_SSIM
-                }
+        # Recurrent blocks for sensitivity map and MR image update
+        for idx, IRB_ in enumerate(self.recurrent):
+            if (self.coils != 1) & (idx != 0):
+                # Checkpoint the SMRB forward pass to reduce memory usage
+                sens_maps_updated = cp.checkpoint(self.SMRB3D, Target_img_f, sens_maps_updated, Target_Kspace_u, mask, gate, idx - 1, self.stepsize, use_reentrant=False)
 
-    def prune(self, *args, **kwargs):
-        assert False, 'Take care of amp'
-        return self.net_mask_tar.prune(*args, **kwargs)
+                # no checkpoint test
+                # sens_maps_updated = self.SMRB3D(Target_img_f, sens_maps_updated, Target_Kspace_u, mask, gate, idx - 1, self.stepsize)
 
-    def get_vis(self, content=None):
-        assert content in [None, 'scalars', 'histograms', 'images']
-        vis = {}
-        if content == 'scalars' or content is None:
-            vis['scalars'] = {}
-            for loss_name in filter(lambda x: x.startswith('loss_'), self.__dict__.keys()):
-                loss_val = getattr(self, loss_name)
-                if loss_val is not None:
-                    vis['scalars'][loss_name] = loss_val.detach().item()
-            for metric_name in filter(lambda x: x.startswith('metric_'), self.__dict__.keys()):
-                metric_val = getattr(self, metric_name)
-                if metric_val is not None:
-                    vis['scalars'][metric_name] = metric_val
-        if content == 'images' or content is None:
-            vis['images'] = {}
-            for image_name in filter(lambda x: x.endswith('_rss'), self.__dict__.keys()):
-                image_val = getattr(self, image_name)
-                if (image_val is not None) and (image_val.shape[1] == 1 or image_val.shape[1] == 3) and not torch.is_complex(image_val):
-                    vis['images'][image_name] = image_val.detach()
-        if content == 'histograms' or content is None:
-            vis['histograms'] = {}
-            if self.net_mask_tar.weight is not None:
-                vis['histograms']['weights'] = {'values': self.net_mask_tar.weight.detach()}
-        return vis
+            # Checkpoint the IRB forward pass to reduce memory usage
+            Target_img_f = cp.checkpoint(IRB_, Target_Kspace_u, Target_img_f, mask, sens_maps_updated, idx, gate, self.stepsize, use_reentrant=False)
+            
+        # Unpad the output data to the original size
+        Target_img_f = utils.unpad_from_max_size(Target_img_f, orginial_size)
+        sens_maps_updated = utils.unpad_from_max_size(sens_maps_updated, orginial_size)
+
+        print(f"Memory Allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB", flush=True)
+        print(f"Memory Reserved: {torch.cuda.memory_reserved() / 1e9:.2f} GB", flush=True)
+
+
+        return Target_img_f, sens_maps_updated

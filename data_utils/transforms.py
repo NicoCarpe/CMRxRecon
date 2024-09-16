@@ -5,26 +5,8 @@ import torch
 
 import fastmri
 
-from subsample import MaskFunc
+from data_utils.subsample import MaskFunc
 from fastmri import fft2c, ifft2c, rss_complex, complex_abs
-
-def to_tensor(data: np.ndarray) -> torch.Tensor:
-    """
-    Convert numpy array to PyTorch tensor.
-
-    For complex arrays, the real and imaginary parts are stacked along the last
-    dimension.
-
-    Args:
-        data: Input numpy array.
-
-    Returns:
-        PyTorch version of data.
-    """
-    if np.iscomplexobj(data):
-        data = np.stack((data.real, data.imag), axis=-1)
-
-    return torch.from_numpy(data)
 
 def apply_mask(
     data: torch.Tensor,
@@ -56,6 +38,7 @@ def apply_mask(
     
     shape = (1,) * len(data.shape[:-3]) + tuple(data.shape[-3:])
     mask, num_low_frequencies = mask_func(shape, offset, seed)
+    
     if padding is not None:
         mask[..., : padding[0], :] = 0
         mask[..., padding[1] :, :] = 0  # padding value inclusive on right of zeros
@@ -77,7 +60,7 @@ class MRISample(NamedTuple):
 
     masked_kspace: torch.Tensor
     mask: torch.Tensor
-    target: torch.Tensor
+    target_k: torch.Tensor
     attrs: Dict
     max_img_size: list
 
@@ -109,7 +92,7 @@ class MRIDataTransform:
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str]:
         """
         Args:
-            kspace: Input k-space with shape (t, c, x, y)
+            kspace: Input k-space with shape (c, t, x, y)
             mask: Undersampling mask with shape (t, x, y)
             target: Target image with shape (t, x, y)
             attrs: Acquisition related information stored in the HDF5 object.
@@ -123,13 +106,14 @@ class MRIDataTransform:
         """
 
         if target is not None:
-            target_torch = to_tensor(target)
+            target_torch = torch.from_numpy(target)
             max_value = attrs["max"]
         else:
             target_torch = torch.tensor(0)
             max_value = 0.0
 
-        kspace_torch = to_tensor(kspace)
+        kspace_torch = torch.from_numpy(kspace)  # Direct conversion from numpy array to PyTorch tensor
+
         seed = None if not self.use_seed else tuple(map(ord, fname)) # so in validation, the same fname (volume) will have the same acc
         acq_start = 0
         acq_end = attrs["padding_right"]
@@ -141,45 +125,45 @@ class MRIDataTransform:
 
             sample = MRISample(
                 masked_kspace=masked_kspace,
-                mask=mask_torch.to(torch.bool),
-                target=target_torch,
-                attrs=attrs
+                mask=mask_torch.to(torch.bool),     # convert to boolean tensor for memory efficiency
+                target_k=kspace_torch,
+                attrs=attrs,
+                max_img_size=max_img_size
             )
         else:
-            # determine what type of mask is used
-            if mask.ndim == 3:
-                nt, nx, ny = np.array(mask.shape)
+            # Get the shape of the k-space data
+            kspace_shape = kspace_torch.shape
+            nc, nt, nx, ny = kspace_shape  # Assuming k-space is [nc, nt, nx, ny]
 
-                # Create the mask shape with singletons for coil dimension
-                mask_shape = (nt, 1, nx, ny)
+            # Determine mask shape and adjust for interleaving
+            if mask.ndim == 3:  # Temporal interleaving, mask is [nt, nx, ny]
+                # Adjust mask to [1, nt, nx, ny] to match k-space
+                mask_shape = [1, nt, nx, ny]
 
-            elif mask.ndim == 2:
-                nx, ny = np.array(mask.shape)
-
-                # Create the mask shape with singletons for coil dimension
-                mask_shape = (1, 1, nx, ny)
-
-            # Reshape and apply the mask
+            elif mask.ndim == 2:  # Spatial mask only, mask is [nx, ny]
+                # Adjust mask to [1, 1, nx, ny] for broadcasting
+                mask_shape = [1, 1, nx, ny]
+            
+            # Convert the numpy mask to a torch tensor and reshape it to the correct dimensions
             mask_torch = torch.from_numpy(mask.reshape(*mask_shape).astype(np.float32))
-            mask_torch[..., :acq_start] = 0
-            mask_torch[..., acq_end:] = 0
 
-            # Expand the mask to match k-space data dimensions
-            kspace_shape = np.array(kspace.shape)
-            mask_torch = mask_torch.expand(*kspace_shape)
+            # Zero out regions outside the acquisition window in the mask
+            mask_torch[:, :, :, :acq_start] = 0
+            mask_torch[:, :, :, acq_end:] = 0
 
             # Apply the mask to k-space data
-            masked_kspace = kspace_torch * mask_torch + 0.0  # the + 0.0 removes the sign of the zeros
+            masked_kspace = kspace_torch * mask_torch + 0.0  # Ensure numerical stability
 
             sample = MRISample(
                 masked_kspace=masked_kspace,
                 mask=mask_torch.to(torch.bool),     # convert to boolean tensor for memory efficiency
-                target=target_torch,
+                target_k=kspace_torch,
                 attrs=attrs,
                 max_img_size=max_img_size
             )
 
         return sample
+
     
 class FastmriKneeMRIDataTransform:
     """
@@ -269,13 +253,13 @@ class FastmriKneeMRIDataTransform:
         is_testing = (target is None)
 
         if target is not None:
-            target_torch = to_tensor(target)
+            target_torch = torch.from_numpy(target)
             max_value = attrs["max"]
         else:
             target_torch = torch.tensor(0)
             max_value = 0.0
 
-        kspace_torch = to_tensor(kspace)
+        kspace_torch = torch.from_numpy(kspace)
 
         if not is_testing:
             kspace_torch = self._to_uniform_size(kspace_torch)

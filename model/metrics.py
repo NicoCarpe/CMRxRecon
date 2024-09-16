@@ -16,7 +16,7 @@ def to_numpy(*args):
             arg = arg.detach().cpu()
         if hasattr(arg, 'numpy') and callable(arg.numpy):
             arg = arg.detach().numpy()
-        assert len(arg.shape) == 5, 'wrong shape [batch, temporal, channel=1, rows, cols]'
+        assert len(arg.shape) == 5, 'wrong shape [batch, channel, temporal, rows, cols]'
         outputs.append(arg)
     return outputs
 
@@ -51,6 +51,7 @@ def nmse(gt, pred, gt_flag=True):
 def psnr(gt, pred, gt_flag=True):
     if gt_flag:
         gt, pred = to_numpy(gt, pred)
+        # Compute PSNR on the first channel (index 0), assuming it’s the relevant one
         psnr = np.mean([compare_psnr(g[0], p[0], data_range=1) for g, p in zip(gt, pred)]).item()
     else:
         psnr = -1000
@@ -60,14 +61,15 @@ def psnr(gt, pred, gt_flag=True):
 def ssim(gt, pred, gt_flag=True):
     if gt_flag:
         gt, pred = to_numpy(gt, pred)
-        ssim = np.mean([compare_ssim(g[0], p[0], data_range=1) for g, p in zip(gt, pred)]).item()
+        # Compute SSIM on the first channel (index 0), assuming it’s the relevant one
+        ssim = np.mean([compare_ssim(g[0], p[0], data_range=1) for g, p in zip(gt, pred)])  # SSIM does not return .item()
     else:
         ssim = -1000
     return ssim
 
 
 if __name__ == "__main__":
-    gt, pred = np.random.rand(10, 5, 1, 100, 100), np.random.rand(10, 5, 1, 100, 100)
+    gt, pred = np.random.rand(10, 1, 5, 100, 100), np.random.rand(10, 1, 5, 100, 100)
     print('MSE', mse(gt, pred))
     print('NMSE', nmse(gt, pred))
     print('PSNR', psnr(gt, pred))

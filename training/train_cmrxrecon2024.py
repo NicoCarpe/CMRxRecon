@@ -2,10 +2,17 @@ import os
 from argparse import ArgumentParser
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.strategies import DDPStrategy
+from pytorch_lightning.profilers import PyTorchProfiler
 import yaml
-from ..data_utils.transforms import MRIDataTransform
-from ..data_modules.cmrxrecon2024_data_module import CmrxReconDataModule
-from ..data_modules.model_module import ReconMRIModule
+from pathlib import Path
+from data_utils.transforms import MRIDataTransform
+from data_modules.cmrxrecon2024_data_module import CmrxReconDataModule
+from data_modules.model_module import ReconMRIModule
+import torch  # Import torch
+from torch.profiler import schedule, tensorboard_trace_handler, ProfilerActivity
+
 
 def cli_main(args):
     pl.seed_everything(args.seed)
@@ -33,53 +40,84 @@ def cli_main(args):
     # ------------
     # model
     # ------------
-    model = ReconMRIModule(
-        lr=args.lr,
-        lr_step_size=args.lr_step_size,
-        lr_gamma=args.lr_gamma,
-        weight_decay=args.weight_decay,
-        coils=args.coils,
-        num_heads=args.num_heads,
-        window_size=args.window_size,
-        depths=args.depths,
-        patch_size=args.patch_size,
-        embed_dim=args.embed_dim,
-        mlp_ratio=args.mlp_ratio,
-        use_amp=args.use_amp,
-        num_recurrent=args.num_recurrent,
-        sens_chans=args.sens_chans,
-        sens_steps=args.sens_steps,
-        lambda0=args.lambda0,
-        lambda1=args.lambda1,
-        lambda2=args.lambda2,
-        lambda3=args.lambda3,
-        GT=args.GT,
-        n_SC=args.n_SC
-    )
+    model = ReconMRIModule(**vars(args))  # Unpack args as kwargs
 
     # ------------
     # logger
     # ------------
-    output_dir = os.path.join(args.output_dir, "logs")
-    logger = TensorBoardLogger(save_dir=output_dir, name="ReconMRI")
+    output_dir = Path(args.output_dir) / "logs"
+    logger = TensorBoardLogger(
+        save_dir=output_dir, 
+        name="ReconMRI",
+        log_graph=True
+    )
 
     # ------------
-    # trainer
+    # profiler
+    # ------------
+    
+    profiler = PyTorchProfiler(
+        dirpath=output_dir / "profile",
+        filename="profiler_trace",
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],  # Capture both CPU and GPU
+        schedule=schedule(wait=1, warmup=1, active=5, repeat=2),
+        on_trace_ready=tensorboard_trace_handler(output_dir / "profile"),
+        with_stack=True,
+        profile_memory=True,  # Capture memory usage
+        record_shapes=True  # Record tensor shapes
+)
+
+    # ------------
+    # checkpoint callback
+    # ------------
+    args.callbacks = [
+        ModelCheckpoint(
+            dirpath=args.checkpoint_dir,
+            save_top_k=-1,  # Save only the best model
+            verbose=True,
+            monitor="validation_loss",
+            mode="min"
+        )
+    ]
+
+    # Logic for handling checkpoint resumption
+    resume_checkpoint_path = None
+    if args.resume_from_checkpoint:
+        ckpt_list = sorted(args.checkpoint_dir.glob("*.ckpt"), key=os.path.getmtime)
+        if ckpt_list:
+            resume_checkpoint_path = str(ckpt_list[-1])
+            print(f"Resuming from the latest checkpoint: {resume_checkpoint_path}")
+        else:
+            print(f"Warning: No checkpoints found in {args.checkpoint_dir}. Starting training from scratch.")
+    else:
+        print("Starting training from scratch.")
+
+    # ------------
+    # trainer setup with DDPStrategy
     # ------------
     trainer = pl.Trainer(
         logger=logger,
-        strategy="ddp",
+        callbacks=args.callbacks,
+        fast_dev_run=False,
+        strategy=DDPStrategy(find_unused_parameters=True, gradient_as_bucket_view=True),  # Use DDP with gradient bucket optimization
         devices=args.num_gpus,
         accelerator="gpu",
         max_epochs=args.max_epochs,
-        gradient_clip_val=args.gradient_clip_val,
-        precision=16 if args.use_amp else 32,
+        gradient_clip_val=args.gradient_clip_val,  # Optional gradient clipping
+        precision="16-mixed" if args.use_amp else 32,  # AMP if enabled, otherwise 32-bit precision
+        profiler=profiler,  # Add the profiler
     )
 
     # ------------
     # run
     # ------------
-    trainer.fit(model, datamodule=data_module)
+    trainer.fit(model, datamodule=data_module, ckpt_path=resume_checkpoint_path)
+
+    # Print CPU times
+    print(profiler.key_averages().table(sort_by="cpu_time_total"), flush=True)
+
+    # Print GPU times
+    print(profiler.key_averages().table(sort_by="cuda_time_total"), flush=True)
 
 def build_args():
     parser = ArgumentParser()
@@ -101,6 +139,7 @@ def run_cli():
     # ---------------------
     # RUN TRAINING
     # ---------------------
+
     cli_main(args)
 
 if __name__ == "__main__":

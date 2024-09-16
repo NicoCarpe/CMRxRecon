@@ -15,7 +15,11 @@
 export HDF5_USE_FILE_LOCKING=FALSE
 export OMP_NUM_THREADS=6
 
-config=~/scratch/CMR-Reconstruction/configs/eval_config.yaml
+# Set PROJECT_ROOT and PYTHONPATH
+export PROJECT_ROOT=~/scratch/CMR-Reconstruction
+export PYTHONPATH=$PROJECT_ROOT:$PYTHONPATH
+
+config=$PROJECT_ROOT/configs/eval_config.yaml
 
 module purge
 
@@ -23,7 +27,7 @@ module purge
 module load matlab/2023b
 module load StdEnv/2023
 module load gcc/12.3
-module load hdf5/1.12.2
+module load hdf5/1.14.2
 module load cuda/12.2
 module load cudnn/8.9.5.29
 module load nccl/2.18.3
@@ -37,10 +41,10 @@ source $SLURM_TMPDIR/env/bin/activate
 pip install --no-index --upgrade pip
 
 # Install packages from Compute Canada wheels
-pip install --no-index -r ~/scratch/CMR-Reconstruction/configs/requirements_local.txt
+pip install --no-index -r $PROJECT_ROOT/configs/requirements_local.txt
 
 # Install packages from PyPI or other sources
-pip install -r ~/scratch/CMR-Reconstruction/configs/requirements_pypi.txt
+pip install -r $PROJECT_ROOT/configs/requirements_pypi.txt
 
 # Verify the configuration file exists
 if [ ! -f "$config" ]; then
@@ -48,6 +52,5 @@ if [ ! -f "$config" ]; then
     exit 1
 fi
 
-
 # Run evaluation
-srun python ~/scratch/CMR-Reconstruction/eval/eval.py --config $config
+srun python $PROJECT_ROOT/eval/eval.py --config $config

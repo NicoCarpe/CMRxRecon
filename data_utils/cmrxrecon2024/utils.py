@@ -3,6 +3,7 @@ import math
 import torch
 import numpy as np
 import torch
+import scipy.io
 
 ############### metric function
 from typing import Optional
@@ -151,18 +152,19 @@ def loadmat_group(group):
 
 def load_kdata(filename):
     '''
-    load kdata from .mat file
-    return shape: [t,nz,nc,ny,nx]
+    Load k-space data from a .mat file.
+    Return shape: [nt, nz, nc, ny, nx]
     '''
+    # Load the .mat file
     data = loadmat(filename)
-    keys = list(data.keys())[0]
-    kdata = data[keys]
     
-    #TODO: Check if we can divide up the real and imaginary aspects of the kdata this way
-    # kdata = kdata['real'] + 1j*kdata['imag']
-    return kdata
-
-
+    # Access the k-space data using the known key
+    kdata = data['kspace_full']
+    
+    # Combine real and imaginary parts to form complex numbers
+    kdata_complex = kdata['real'] + 1j * kdata['imag']
+    
+    return kdata_complex
 
 ############# help function #############
 def matlab_round(n):

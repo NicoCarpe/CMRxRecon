@@ -1,11 +1,11 @@
 #!/bin/bash -l
 #SBATCH -J cmrxrecon_train
-#SBATCH --time=2:00:00
+#SBATCH --time=1:00:00
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=2               # v100l:2
-#SBATCH --cpus-per-gpu=4                # 8
-#SBATCH --mem=32G
+#SBATCH --ntasks-per-node=2                # 4 tasks per node (1 per GPU)
+#SBATCH --gpus-per-node=v100l:2            # 4 GPUs per node
+#SBATCH --cpus-per-task=2                  # Request 8 CPUs per task (adjust if needed)
+#SBATCH --mem=128GB                        # Request 128GB of memory                            
 #SBATCH --account=def-punithak
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=ngcarpen@ualberta.ca
@@ -15,7 +15,13 @@
 export HDF5_USE_FILE_LOCKING=FALSE
 export OMP_NUM_THREADS=6
 
-config=~/scratch/CMR-Reconstruction/configs/train_config.yaml
+# Set PROJECT_ROOT and PYTHONPATH
+export PROJECT_ROOT=/home/nicocarp/scratch/CMR-Reconstruction
+export PYTHONPATH=$PROJECT_ROOT:$PYTHONPATH
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+
+config=$PROJECT_ROOT/configs/train_config.yaml
 
 module purge
 
@@ -23,7 +29,7 @@ module purge
 module load matlab/2023b
 module load StdEnv/2023
 module load gcc/12.3
-module load hdf5/1.12.2
+module load hdf5/1.14.2
 module load cuda/12.2
 module load cudnn/8.9.5.29
 module load nccl/2.18.3
@@ -37,10 +43,10 @@ source $SLURM_TMPDIR/env/bin/activate
 pip install --no-index --upgrade pip
 
 # Install packages from Compute Canada wheels
-pip install --no-index -r ~/scratch/CMR-Reconstruction/configs/requirements_local.txt
+pip install --no-index -r $PROJECT_ROOT/configs/requirements_local.txt
 
 # Install packages from PyPI or other sources
-pip install -r ~/scratch/CMR-Reconstruction/configs/requirements_pypi.txt
+pip install -r $PROJECT_ROOT/configs/requirements_pypi.txt
 
 # Verify the configuration file exists
 if [ ! -f "$config" ]; then
@@ -48,11 +54,15 @@ if [ ! -f "$config" ]; then
     exit 1
 fi
 
-# Run preprocessing if flag is set
+# Extract the run_preprocessing flag from the YAML config
 run_preprocessing=$(python -c "import yaml; print(yaml.safe_load(open('$config'))['run_preprocessing'])")
-if [ "$run_preprocessing" = "true" ]; then
-    srun python ~/scratch/CMR-Reconstruction/data_utils/cmrxrecon2024/preprocess_cmrxrecon2024.py --data_path ~/scratch/CMR-Reconstruction/datasets/CMR_2024/ChallengeData/MultiCoil/ --h5py_folder h5_FullSample/
+echo "Running preprocessing: $run_preprocessing"
+
+# Check if the run_preprocessing flag is set to True
+if [ "$run_preprocessing" = "True" ]; then
+    srun python $PROJECT_ROOT/data_utils/cmrxrecon2024/preprocess_cmrxrecon2024.py --data_path $PROJECT_ROOT/datasets/CMR_2024/ChallengeData/MultiCoil/ --h5py_folder h5_FullSample/
 fi
 
 # Run training
-srun python ~/scratch/CMR-Reconstruction/training/train_cmrxrecon2024.py --config $config
+echo "Running training"
+srun python $PROJECT_ROOT/training/train_cmrxrecon2024.py --config $config

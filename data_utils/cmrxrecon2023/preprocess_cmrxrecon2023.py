@@ -1,13 +1,10 @@
 
 import os
 import sys
-import pathlib
-sys.path.insert(0, os.path.dirname(os.path.dirname(pathlib.Path(__file__).parent.absolute())))
-
 import shutil
 import argparse
 import numpy as np
-from utils import zf_recon
+from data_utils.cmrxrecon2023.utils import zf_recon
 import h5py
 import glob
 from os.path import join

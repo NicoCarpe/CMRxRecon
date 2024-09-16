@@ -10,10 +10,10 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 import matlab.engine
 import fastmri.data.transforms as T
-from ..model.model import ReconModel
-from ..model.utils import pad_to_max_size, unpad_from_max_size, create_padding_mask
-from ..data_utils.cmrxrecon2024.utils import load_kdata, loadmat
-from ..data_utils.cmrxrecon2024.utils import count_parameters, count_trainable_parameters, count_untrainable_parameters
+from model.model import ReconModel
+from model.utils import pad_to_max_size, unpad_from_max_size, create_padding_mask
+from data_utils.cmrxrecon2024.utils import load_kdata, loadmat
+from data_utils.cmrxrecon2024.utils import count_parameters, count_trainable_parameters, count_untrainable_parameters
 
 class Dataset(torch.utils.data.Dataset):
     def __init__(self, fname, num_low_frequencies):
@@ -65,20 +65,10 @@ def predict(config):
         num_heads=model_config['num_heads'],
         window_size=model_config['window_size'],
         depths=model_config['depths'],
-        patch_size=model_config['patch_size'],
         embed_dim=model_config['embed_dim'],
-        mlp_ratio=model_config['mlp_ratio'],
-        qkv_bias=model_config['qkv_bias'],
-        qk_scale=model_config['qk_scale'],
-        drop=model_config['drop'],
-        attn_drop=model_config['attn_drop'],
-        drop_path=model_config['drop_path'],
-        norm_layer=model_config['norm_layer'],
-        n_SC=model_config['n_SC'],
         num_recurrent=model_config['num_recurrent'],
         sens_chans=model_config['sens_chans'],
-        sens_steps=model_config['sens_steps'],
-        scale=model_config['scale']
+        sens_steps=model_config['sens_steps']
     )
 
     print(f'Model:\ntotal param: {count_parameters(model)}\ntrainable param: {count_trainable_parameters(model)}\nuntrainable param: {count_untrainable_parameters(model)}\n##############')
