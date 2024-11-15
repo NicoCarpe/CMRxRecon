@@ -1,52 +1,17 @@
-"""
-@author: sunkg
-
-Extended by Nicolas Carpenter <ngcarpen@ualberta.ca>
-"""
-
 import math
+
 import torch.nn as nn
 import torch
 import torch.fft
 import torch.nn.functional as F
-# from torchmetrics.image import MultiScaleStructuralSimilarityIndexMeasure as MS_SSIM
+
+import fastmri
 from fastmri.losses import SSIMLoss
 
 
-def fft2(x):
-    assert len(x.shape) == 5  # Ensure the input is 5D (B, C, T, X, Y)
-    return torch.fft.fft2(x, dim=(-2, -1), norm='ortho')
-
-
-def ifft2(x):
-    assert len(x.shape) == 5  # Ensure the input is 5D (B, C, T, X, Y)
-    return torch.fft.ifft2(x, dim=(-2, -1), norm='ortho')
-
-
-def fftshift2(x):
-    assert len(x.shape) == 5  # Ensure the input is 5D (B, C, T, X, Y)
-    return torch.roll(x, shifts=(x.shape[-2] // 2, x.shape[-1] // 2), dims=(-2, -1))
-
-
-def ifftshift2(x):
-    assert len(x.shape) == 5  # Ensure the input is 5D (B, C, T, X, Y)
-    return torch.roll(x, shifts=((x.shape[-2] + 1) // 2, (x.shape[-1] + 1) // 2), dims=(-2, -1))
-
-
-def rss(x):
-    assert len(x.shape) == 5  # Ensure the input is 5D (B, C, T, X, Y)
-    return torch.linalg.vector_norm(x, ord=2, dim=1, keepdim=True)  # Sum over coil dimension
-
-
-def rss2d(x):
-    assert len(x.shape) == 2
-    return (x.real ** 2 + x.imag ** 2).sqrt()
-
-
 def ssimloss(x, y, max_val):
-    # Ensure inputs are not complex
-    assert not torch.is_complex(x)
-    assert not torch.is_complex(y)
+    # Ensure inputs are the same shape
+    assert x.shape == y.shape
     
     # Move tensors to GPU if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -55,9 +20,9 @@ def ssimloss(x, y, max_val):
     max_val = max_val.to(device)
 
     # Reshape the input tensors to combine the batch and temporal dimensions
-    B, C, T, X, Y = x.shape
-    x_reshaped = x.view(B * T, C, X, Y)
-    y_reshaped = y.view(B * T, C, X, Y)
+    B, T, X, Y = x.shape
+    x_reshaped = x.view(B * T, 1, X, Y)
+    y_reshaped = y.view(B * T, 1, X, Y)
     
     # Instantiate the SSIMLoss class and ensure it's on the correct device
     ssim_loss_fn = SSIMLoss().to(device)
@@ -66,12 +31,7 @@ def ssimloss(x, y, max_val):
     return ssim_loss
 
 
-def psnr(mse_loss, max_val):
-    psnr = 20 * torch.log10(max_val) - 10 * torch.log10(mse_loss)
-    return psnr
-
-
-def combined_loss(rec_img, target_img, sens_maps, masked_kspace, mask, max_val, alpha=0.5, beta=0.5, lambda_SM=0.1):
+def combined_loss(target_img, rec_img, max_val, loss_sc, alpha=0.5, beta=0.5, lambda_SM=0.1):
     # SSIM and L1 Loss for Image Reconstruction
     loss_ssim = ssimloss(rec_img, target_img, max_val)
     loss_l1_image = F.l1_loss(rec_img, target_img)
@@ -79,11 +39,8 @@ def combined_loss(rec_img, target_img, sens_maps, masked_kspace, mask, max_val, 
     # Weighted combination of SSIM and L1 for image loss
     loss_image = beta * loss_ssim + (1 - beta) * loss_l1_image
     
-    # L1 Loss for Sensitivity Map Consistency
-    loss_sensitivity_consistency = F.l1_loss(mask * sens_expand(rec_img, sens_maps), masked_kspace)
-    
     # Final combined loss: Image loss with alpha scaling + Sensitivity Map loss with lambda scaling
-    combined_loss = alpha * loss_image + lambda_SM * loss_sensitivity_consistency
+    combined_loss = alpha * loss_image + lambda_SM * loss_sc
     
     return combined_loss
 
@@ -92,6 +49,14 @@ def gaussian_kernel_1d(sigma):
     kernel_size = int(2 * math.ceil(sigma * 2) + 1)
     x = torch.linspace(-(kernel_size - 1) // 2, (kernel_size - 1) // 2, kernel_size).cuda()
     kernel = 1.0 / (sigma * math.sqrt(2 * math.pi)) * torch.exp(-(x**2) / (2 * sigma**2))
+    kernel = kernel / torch.sum(kernel)
+    return kernel
+
+
+def gaussian_kernel_2d(sigma):
+    y_1 = gaussian_kernel_1d(sigma[0])
+    y_2 = gaussian_kernel_1d(sigma[1])
+    kernel = torch.tensordot(y_1, y_2, 0)
     kernel = kernel / torch.sum(kernel)
     return kernel
 
@@ -108,12 +73,20 @@ def gaussian_kernel_3d(sigma):
     return kernel
 
 
+def gaussian_smooth(img, sigma):
+    sigma = max(sigma, 1e-12)
+    kernel = gaussian_kernel_2d((sigma, sigma))[None, None, :, :].to(img)
+    padding = kernel.shape[-1]//2
+    img = torch.nn.functional.conv2d(img, kernel, padding=padding)
+    return img
+
+
 def gaussian_smooth_3d(img, sigma):
     """
-    Apply Gaussian smoothing over the spatial (X, Y) and temporal (T) dimensions.
+    Apply Gaussian smoothing over the spatial (H, W) and temporal (T) dimensions.
     Args:
-        img: Input tensor with shape [B, C, T, X, Y].
-        sigma: A tuple containing the standard deviations for the Gaussian kernel in T, X, and Y dimensions.
+        img: Input tensor with shape [B, C, T, H, W].
+        sigma: A tuple containing the standard deviations for the Gaussian kernel in T, H, and W dimensions.
     Returns:
         smoothed_img: Smoothed tensor with the same shape as the input.
     """
@@ -127,55 +100,66 @@ def gaussian_smooth_3d(img, sigma):
     return smoothed_img
 
 
-def TV_loss(img, weight):
-    bs_img, c_img, t_img, x_img, y_img = img.size()
-    tv_t = torch.pow(img[:, :, 1:, :, :] - img[:, :, :-1, :, :], 2).sum()
-    tv_x = torch.pow(img[:, :, :, 1:, :] - img[:, :, :, :-1, :], 2).sum()
-    tv_y = torch.pow(img[:, :, :, :, 1:] - img[:, :, :, :, :-1], 2).sum()
-    return (weight * (tv_t + tv_x + tv_y)) / (bs_img * c_img * t_img * x_img * y_img)
-
-
 def complex_to_chan_dim(x: torch.Tensor) -> torch.Tensor:
-    assert torch.is_complex(x)
-    return torch.cat([x.real, x.imag], dim=1)  # Concatenate along the channel dimension
+    shape_len = len(x.shape)
+
+    if shape_len == 6:
+        b, c, t, h, w, two = x.shape
+        assert two == 2
+        return x.permute(0, 5, 1, 2, 3, 4).reshape(b, 2 * c, t, h, w)
+    
+    elif shape_len == 5:
+        b, c, h, w, two = x.shape
+        assert two == 2
+        return x.permute(0, 4, 1, 2, 3).reshape(b, 2 * c, h, w)
 
 
-def chan_dim_to_complex(x: torch.Tensor) -> torch.Tensor:
-    assert not torch.is_complex(x)
-    _, C, _, _, _ = x.shape
-    assert C % 2 == 0
-    C = C // 2
-    return torch.complex(x[:, :C, :, :, :], x[:, C:, :, :, :])
+def chan_complex_to_last_dim(x: torch.Tensor) -> torch.Tensor:
+    shape_len = len(x.shape)
+
+    if shape_len == 5:
+        b, c2, t, h, w = x.shape
+        assert c2 % 2 == 0
+        c = c2 // 2
+        return x.view(b, 2, c, t, h, w).permute(0, 2, 3, 4, 5, 1).contiguous()
+    
+    elif shape_len == 4:
+        b, c2, h, w = x.shape
+        assert c2 % 2 == 0
+        c = c2 // 2
+        return x.view(b, 2, c, h, w).permute(0, 2, 3, 4, 1).contiguous()
 
 
-def sens_expand(image: torch.Tensor, sens_maps: torch.Tensor) -> torch.Tensor:
-    return fft2(image * sens_maps)
+def sens_expand(x: torch.Tensor, sens_maps: torch.Tensor) -> torch.Tensor:
+        return fastmri.fft2c(fastmri.complex_mul(x, sens_maps))
 
 
-def sens_reduce(kspace: torch.Tensor, sens_maps: torch.Tensor) -> torch.Tensor:
-    return (ifft2(kspace) * sens_maps.conj()).sum(dim=1, keepdim=True)  # Sum over coil dimension
+def sens_reduce(x: torch.Tensor, sens_maps: torch.Tensor) -> torch.Tensor:
+    return fastmri.complex_mul(
+        fastmri.ifft2c(x), fastmri.complex_conj(sens_maps)
+    ).sum(dim=1, keepdim=True)
 
 
 def pad_to_max_size(tensor, max_size):
     """
     Pad the input tensor to the specified max size.
     Args:
-        tensor: Input tensor of shape (B, C, T, X, Y) or (B, T, X, Y) to be padded.
-        max_size: The target size to pad the tensor to, in the form (T, X, Y).
+        tensor: Input tensor of shape: image--> (B, C, T, H, W, comp) or mask--> (B, T, H, W, comp) to be padded.
+        max_size: The target size to pad the tensor to, in the form (T, H, W).
     Returns:
         Padded tensor and the original shape of the tensor.
     """
-    
     # Record the original size
     original_size = list(tensor.size())
 
     # Pad the tensor
     # PyTorch's padding expects order 
-    # [pad_t_left, pad_t_right, pad_x_left, pad_x_right, pad_y_left, pad_y_right]
+    # [pad_t_left, pad_t_right, pad_h_left, pad_h_right, pad_w_left, pad_w_right]
     padding = [
-        0, max_size[2] - tensor.size(-1),  # y dimension
-        0, max_size[1] - tensor.size(-2),  # x dimension
-        0, max_size[0] - tensor.size(-3)   # t dimension
+        0, 0,                              # comp dim needs to be accounted for
+        0, max_size[2] - tensor.size(-2),  # w dimension
+        0, max_size[1] - tensor.size(-3),  # h dimension
+        0, max_size[0] - tensor.size(-4)   # t dimension
     ]
 
     padded_tensor = nn.functional.pad(tensor, padding)
@@ -192,7 +176,7 @@ def unpad_from_max_size(tensor, original_size):
     Returns:
         Unpadded tensor.
     """
-    return tensor[:, :, :original_size[2], :original_size[3], :original_size[4]]
+    return tensor[:, :, :original_size[2], :original_size[3], :original_size[4], :]
 
 
 def create_padding_mask(tensor, max_size):

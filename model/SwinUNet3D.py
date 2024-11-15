@@ -5,19 +5,21 @@ from einops.layers.torch import Rearrange
 from typing import Union, List
 import numpy as np
 from timm.models.layers import trunc_normal_
+from model.triton.layer_norm import LayerNorm
 
 
-class CyclicShift3D(nn.Module):
-    def __init__(self, displacement):
-        super().__init__()
+def layer_norm(x):
+    # LayerNorm parameters
+    normalized_shape = x.shape[-1]
+    weight = torch.ones(normalized_shape, device=x.device, dtype=x.dtype)
+    bias = torch.zeros(normalized_shape, device=x.device, dtype=x.dtype)
+    eps = 1e-5
 
-        assert type(displacement) is int or len(displacement) == 3, f'displacement must be 1 or 3 dimension'
-        if type(displacement) is int:
-            displacement = np.array([displacement, displacement, displacement])
-        self.displacement = displacement
+    # Using Triton-based LayerNorm
+    layer_norm = LayerNorm.apply
+    y_triton = layer_norm(x, normalized_shape, weight, bias, eps)
 
-    def forward(self, x):
-        return torch.roll(x, shifts=(self.displacement[0], self.displacement[1], self.displacement[2]), dims=(1, 2, 3))
+    return y_triton
 
 
 class Residual3D(nn.Module):
@@ -33,6 +35,7 @@ class PreNorm3D(nn.Module):
     def __init__(self, dim, fn):
         super().__init__()
         self.norm = nn.LayerNorm(dim)
+        #self.norm = layer_norm(dim)
         self.fn = fn
 
     def forward(self, x, **kwargs):
@@ -57,38 +60,35 @@ class FeedForward3D(nn.Module):
 
 def create_mask3D(window_size: Union[int, List[int]], displacement: Union[int, List[int]],
                   t_shift: bool, x_shift: bool, y_shift: bool):
-    assert type(window_size) is int or len(window_size) == 3, f'window_size must be 1 or 3 dimension'
+    assert type(window_size) is int or len(window_size) == 3, f'window_size must be 1 or 3 dimensions'
     if type(window_size) is int:
-        window_size = np.array([window_size, window_size, window_size])
+        window_size = np.array([window_size] * 3)
 
-    assert type(displacement) is int or len(displacement) == 3, f'displacement must be 1 or 3 dimension'
+    assert type(displacement) is int or len(displacement) == 3, f'displacement must be 1 or 3 dimensions'
     if type(displacement) is int:
-        displacement = np.array([displacement, displacement, displacement])
+        displacement = np.array([displacement] * 3)
 
     assert len(window_size) == len(displacement)
     for i in range(len(window_size)):
         assert 0 < displacement[i] < window_size[i], \
-            f'在第{i}轴的偏移量不正确，维度包括T(i=0)，X(i=1)和Y(i=2)'
+            f'Invalid displacement on axis {i}. Dimensions include T(i=0), X(i=1), and Y(i=2)'
 
     mask = torch.zeros(window_size[0] * window_size[1] * window_size[2],
                        window_size[0] * window_size[1] * window_size[2])  # (wt*wx*wy, wt*wx*wy)
     mask = rearrange(mask, '(t1 x1 y1) (t2 x2 y2) -> t1 x1 y1 t2 x2 y2',
                      x1=window_size[1], y1=window_size[2], x2=window_size[1], y2=window_size[2])
 
-    t_dist, x_dist, y_dist = displacement[0], displacement[1], displacement[2]
+    t_dist, x_dist, y_dist = displacement
 
     if t_shift:
-        #     t1     x1 y1     t2     x2 y2
         mask[-t_dist:, :, :, :-t_dist, :, :] = float('-inf')
         mask[:-t_dist, :, :, -t_dist:, :, :] = float('-inf')
 
     if x_shift:
-        #     t1     x1     y1 t2  x2     y2
         mask[:, -x_dist:, :, :, :-x_dist, :] = float('-inf')
         mask[:, :-x_dist, :, :, -x_dist:, :] = float('-inf')
 
     if y_shift:
-        #     t1  x1  y1     t2 x2  y2
         mask[:, :, -y_dist:, :, :, :-y_dist] = float('-inf')
         mask[:, :, :-y_dist, :, :, -y_dist:] = float('-inf')
 
@@ -96,75 +96,35 @@ def create_mask3D(window_size: Union[int, List[int]], displacement: Union[int, L
     return mask
 
 
-# 参考自video_swin_transformer:
-# #https://github.com/MohammadRezaQaderi/Video-Swin-Transformer/blob/c3cd8639decf19a25303615db0b6c1195495f5bb/mmaction/models/backbones/swin_transformer.py#L119
-def get_relative_distances(window_size):
-    assert type(window_size) is int or len(window_size) == 3, f'window_size must be 1 or 3 dimension'
-    if type(window_size) is int:
-        window_size = np.array([window_size, window_size, window_size])
-    indices = torch.tensor(
-        np.array(
-            [[t, x, y] for t in range(window_size[0]) for x in range(window_size[1]) for y in range(window_size[2])]))
-
-    distances = indices[None, :, :] - indices[:, None, :]
-    # distance:(n,n,3) n =window_size[0]*window_size[1]*window_size[2]
-    return distances
-
-
 class WindowAttention3D(nn.Module):
-    def __init__(self, dim: int, heads: int, head_dim: int, shifted: bool, window_size: Union[int, List[int]],
-                 relative_pos_embedding: bool = True):
+    def __init__(self, dim, heads, head_dim, shifted, window_size: Union[int, List[int]], relative_pos_embedding=True):
         super().__init__()
-
-        assert type(window_size) is int or len(window_size) == 3, f'window_size must be 1 or 3 dimension'
-        if type(window_size) is int:
-            window_size = np.array([window_size, window_size, window_size])
-        else:
-            window_size = np.array(window_size)
-
         inner_dim = head_dim * heads
         self.heads = heads
+        self.window_size = np.array(window_size) if isinstance(window_size, list) else np.array([window_size] * 3)
         self.scale = head_dim ** -0.5
-        self.window_size = window_size
-        # self.relative_pos_embedding = relative_pos_embedding
+
         self.shifted = shifted
-
         if self.shifted:
-            displacement = window_size // 2
-            self.cyclic_shift = CyclicShift3D(-displacement)
-            self.cyclic_back_shift = CyclicShift3D(displacement)
-            self.t_mask = nn.Parameter(create_mask3D(window_size=window_size, displacement=displacement,
-                                                     t_shift=True, x_shift=False, y_shift=False), requires_grad=False)
-            self.x_mask = nn.Parameter(create_mask3D(window_size=window_size, displacement=displacement,
-                                                     t_shift=False, x_shift=True, y_shift=False), requires_grad=False)
-            self.y_mask = nn.Parameter(create_mask3D(window_size=window_size, displacement=displacement,
-                                                     t_shift=False, x_shift=False, y_shift=True), requires_grad=False)
+            self.shift_size = self.window_size // 2
+        else:
+            self.shift_size = np.array([0, 0, 0])
 
-        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)  # QKV三个
+        # Masking to handle attention for shifted windows
+        if self.shifted:
+            self.t_mask = nn.Parameter(create_mask3D(self.window_size, self.shift_size, t_shift=True, x_shift=False, y_shift=False), requires_grad=False)
+            self.x_mask = nn.Parameter(create_mask3D(self.window_size, self.shift_size, t_shift=False, x_shift=True, y_shift=False), requires_grad=False)
+            self.y_mask = nn.Parameter(create_mask3D(self.window_size, self.shift_size, t_shift=False, x_shift=False, y_shift=True), requires_grad=False)
 
-        # if self.relative_pos_embedding:
-        #     self.relative_indices = get_relative_distances(window_size)
-        #     # relative_indices的形状为 (n,n,3) n=window_size[0]*window_size[1]*window_size[2],
-        #
-        #     for i in range(len(window_size)):  # 在每个维度上进行偏移
-        #         self.relative_indices[:, :, i] += window_size[i] - 1
-        #
-        #     self.pos_embedding = nn.Parameter(
-        #         torch.randn(2 * window_size[0] - 1, 2 * window_size[1] - 1, 2 * window_size[2] - 1)
-        #     )
-        # else:
-        # self.pos_embedding = nn.Parameter(torch.randn(window_size[0] * window_size[1] * window_size[2],
-        #                                               window_size[0] * window_size[1] * window_size[2]))
-
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
         self.softmax = nn.Softmax(dim=-1)
         self.to_out = nn.Linear(inner_dim, dim)
 
     def forward(self, x):
         if self.shifted:
-            x = self.cyclic_shift(x)
+            x = torch.roll(x, shifts=(-self.shift_size[0], -self.shift_size[1], -self.shift_size[2]), dims=(1, 2, 3))
 
         b, n_t, n_x, n_y, _, h = *x.shape, self.heads
-
         qkv = self.to_qkv(x).chunk(3, dim=-1)
 
         nw_t = n_t // self.window_size[0]
@@ -175,61 +135,68 @@ class WindowAttention3D(nn.Module):
             lambda t: rearrange(t, 'b (nw_t w_t) (nw_x w_x) (nw_y w_y) (h d) -> b h (nw_t nw_x nw_y) (w_t w_x w_y) d',
                                 h=h, w_t=self.window_size[0], w_x=self.window_size[1], w_y=self.window_size[2]), qkv)
 
-        dots = einsum('b h w i d, b h w j d -> b h w i j', q, k) * self.scale  # q和k的矩阵乘法
+        # similarity scores between the vectors from q and k for each combination of the indices i and j
+        dots = einsum('b h w i d, b h w j d -> b h w i j', q, k) * self.scale
 
-        # if self.relative_pos_embedding:
-        #     dots += self.pos_embedding[self.relative_indices[:, :, 0].long(), self.relative_indices[:, :, 1].long(),
-        #                                self.relative_indices[:, :, 2].long()]
-        # else:
-        #   dots += self.pos_embedding  # 触发了广播机制
-
+        # Apply window-specific masking for shifted windows
         if self.shifted:
-            # 将x轴的窗口数量移至尾部，便于和x轴上对应的mask叠加，下同
-            dots = rearrange(dots, 'b h (n_t n_x n_y) i j -> b h n_x n_y n_t i j',
-                             n_x=nw_x, n_y=nw_y)
-            #   b   h n_x n_y n_t i j
+            dots = rearrange(dots, 'b h (n_t n_x n_y) i j -> b h n_x n_y n_t i j', n_x=nw_x, n_y=nw_y)
             dots[:, :, :, :, -1] += self.t_mask
-
             dots = rearrange(dots, 'b h n_x n_y n_t i j -> b h n_t n_y n_x i j')
             dots[:, :, :, :, -1] += self.x_mask
-
             dots = rearrange(dots, 'b h n_t n_y n_x i j -> b h n_t n_x n_y i j')
             dots[:, :, :, :, -1] += self.y_mask
-
             dots = rearrange(dots, 'b h n_t n_x n_y i j -> b h (n_t n_x n_y) i j')
 
-        # attn = dots.softmax(dim=-1)
         attn = self.softmax(dots)
-        out = einsum('b h w i j, b h w j d -> b h w i d', attn, v)  # 进行attn和v的矩阵乘法
+        
+        # performs a weighted sum of the values
+        out = einsum('b h w i j, b h w j d -> b h w i d', attn, v)
 
-        # nw_t 表示 t 轴上窗口的数量 , nw_x 表示 x 轴上窗口的数量，nw_y 表示 y 轴上窗口的数量
-        # w_t 表示 t_window_size, w_x 表示 x_window_size，w_y 表示 y_window_size
-        #                     b 3  (8,8,8)         （7,  7,  7） 96 -> b  56          56          56        288
         out = rearrange(out, 'b h (nw_t nw_x nw_y) (w_t w_x w_y) d -> b (nw_t w_t) (nw_x w_x) (nw_y w_y) (h d)',
-                    h=h, w_t=self.window_size[0], w_x=self.window_size[1], w_y=self.window_size[2],
-                    nw_t=nw_t, nw_x=nw_x, nw_y=nw_y)
+                        h=h, w_t=self.window_size[0], w_x=self.window_size[1], w_y=self.window_size[2],
+                        nw_t=nw_t, nw_x=nw_x, nw_y=nw_y)
+
         out = self.to_out(out)
 
         if self.shifted:
-            out = self.cyclic_back_shift(out)
+            out = torch.roll(out, shifts=(self.shift_size[0], self.shift_size[1], self.shift_size[2]), dims=(1, 2, 3))
+
         return out
 
 
-class SwinBlock3D(nn.Module):  # 不会改变输入空间分辨率
-    def __init__(self, dim, heads, head_dim, mlp_dim, shifted, window_size: Union[int, List[int]],
-                 relative_pos_embedding: bool = True, dropout: float = 0.0):
+
+class SwinBlock3D(nn.Module):
+    def __init__(self, dim, heads, head_dim, mlp_dim, shifted, window_size, relative_pos_embedding=True, dropout=0.0):
         super().__init__()
-        self.attention_block = Residual3D(PreNorm3D(dim, WindowAttention3D(dim=dim,
-                                                                           heads=heads,
-                                                                           head_dim=head_dim,
-                                                                           shifted=shifted,
-                                                                           window_size=window_size,
-                                                                           relative_pos_embedding=relative_pos_embedding)))
-        self.mlp_block = Residual3D(PreNorm3D(dim, FeedForward3D(dim=dim, hidden_dim=mlp_dim, dropout=dropout)))
+
+        self.shifted = shifted  # Whether to use the shifted window mechanism
+        self.window_size = window_size  # Window size
+
+        # Residual attention block with or without shift
+        self.attention_block = Residual3D(
+            PreNorm3D(dim, WindowAttention3D(
+                dim=dim,
+                heads=heads,
+                head_dim=head_dim,
+                shifted=shifted,
+                window_size=window_size,
+                relative_pos_embedding=relative_pos_embedding
+            ))
+        )
+
+        # MLP block after attention with residual
+        self.mlp_block = Residual3D(
+            PreNorm3D(dim, FeedForward3D(dim=dim, hidden_dim=mlp_dim, dropout=dropout))
+        )
 
     def forward(self, x):
+        # Apply attention block (with or without shift depending on the value of `shifted`)
         x = self.attention_block(x)
+
+        # Apply the feed-forward MLP block
         x = self.mlp_block(x)
+
         return x
 
 
@@ -240,12 +207,14 @@ class Norm(nn.Module):
             self.net = nn.Sequential(
                 Rearrange('b c t x y -> b t x y c'),
                 nn.LayerNorm(dim),
+                # layer_norm(dim)
                 Rearrange('b t x y c -> b c t x y')
             )
 
             # self.net = nn.InstanceNorm3d(dim, eps=1e-5, momentum=0.1, affine=False)
         else:
             self.net = nn.LayerNorm(dim)
+            # self.net = layer_norm(dim)
 
     def forward(self, x):
         x = self.net(x)

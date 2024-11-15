@@ -19,7 +19,6 @@ embed_dim: 96
 use_amp: True
 num_recurrent: 8 
 sens_chans: 8
-sens_steps: 4
 alpha: 0.7
 beta: 0.5 
 lambda_SM: 0.3   

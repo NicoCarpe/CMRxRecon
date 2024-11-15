@@ -11,7 +11,7 @@ import torch.utils.checkpoint as cp
 
 from fastmri import ifft2c, rss
 
-from model import SwinUNet3D, SM_models2D, utils
+from model import SwinUNet3D, SM_models2D_series, utils
 
 
 class IRB(nn.Module):
@@ -62,7 +62,7 @@ class ReconModel(nn.Module):
         super().__init__()
 
         # Initialize sensitivity map network
-        self.SMEB = SM_models2D.SMEB(
+        self.SMEB = SM_models2D_series.SMEB(
             in_chans=2,
             out_chans=2,
             chans=sens_chans,
@@ -85,21 +85,11 @@ class ReconModel(nn.Module):
                                         for _ in range(num_recurrent)])
 
         # Initialize convolution blocks for sensitivity map refinement
-        self.ConvBlockSM = nn.ModuleList([SM_models2D.ConvBlockSM(in_chans=2, out_chans=2) for _ in range(num_recurrent - 1)])
+        self.ConvBlockSM = nn.ModuleList([SM_models2D_series.ConvBlockSM(in_chans=2, out_chans=2) for _ in range(num_recurrent - 1)])
 
     def SMRB(self, Target_img_f, sens_maps_updated, Target_Kspace_u, mask, gate, idx, stepsize):
         """
-        Sensitivity map refinement block (SMRB) with parallel processing over temporal dimension.
-        Args:
-            Target_img_f: Target image in frequency domain.
-            sens_maps_updated: Updated sensitivity maps.
-            Target_Kspace_u: Undersampled K-space data.
-            mask: K-space mask.
-            gate: Gating parameter.
-            idx: Index of the current recurrent block.
-            stepsize: Step size for sensitivity map update.
-        Returns:
-            Updated sensitivity maps.
+        Sensitivity map refinement block (SMRB) with sequential processing over the temporal dimension.
         """
         sens_maps_updated.requires_grad_(True)
 
@@ -107,17 +97,31 @@ class ReconModel(nn.Module):
         Target_Kspace_f = utils.sens_expand(Target_img_f, sens_maps_updated)
         b, c, t, h, w, comp = sens_maps_updated.shape
 
-        # Reshape to process all temporal slices as a batch
-        sens_maps_batched = sens_maps_updated.reshape(b * c * t, 1, h, w, comp)
-        sens_maps_batched = utils.complex_to_chan_dim(sens_maps_batched)
-        
+        # Initialize an empty tensor to store the updated sensitivity maps
+        updated_sens_maps = torch.zeros_like(sens_maps_updated)
 
-        # Apply the ConvBlockSM to all temporal slices in parallel
-        sens_maps_batched = self.ConvBlockSM[idx](sens_maps_batched)
+        # Reshape to batch the coil dimension
+        sens_maps_batched = sens_maps_updated.view(b * c, 1, t, h, w, comp)
 
-        # Convert back to complex format and reshape to original dimensions
-        sens_maps_batched = utils.chan_complex_to_last_dim(sens_maps_batched)
-        sens_maps_updated = sens_maps_batched.reshape(b, c, t, h, w, comp)
+        # Loop over the temporal dimension
+        for time_idx in range(t):
+            # Select the temporal slice for processing
+            sens_maps_slice = sens_maps_batched[:, :, time_idx, :, :, :]
+
+            # Convert to channel format for ConvBlockSM
+            sens_maps_slice = utils.complex_to_chan_dim(sens_maps_slice)
+
+            # Apply ConvBlockSM to the current temporal slice
+            sens_maps_slice = self.ConvBlockSM[idx](sens_maps_slice)
+
+            # Convert back to complex format
+            sens_maps_slice = utils.chan_complex_to_last_dim(sens_maps_slice)
+
+            # Update the corresponding temporal slice in the final tensor
+            updated_sens_maps[:, :, time_idx, :, :, :] = sens_maps_slice
+
+        # Reshape back to original dimensions
+        sens_maps_updated = updated_sens_maps.view(b, c, t, h, w, comp)
 
         # Sensitivity map update
         sens_maps_updated = sens_maps_updated - stepsize * (
@@ -128,6 +132,7 @@ class ReconModel(nn.Module):
         sens_maps_updated = sens_maps_updated * gate
 
         return sens_maps_updated
+
 
 
     def forward(self, target_kspace_u, mask, num_low_frequencies, attrs, max_img_size):
@@ -149,7 +154,7 @@ class ReconModel(nn.Module):
             sens_maps_updated = torch.ones_like(target_kspace_u)
             gate = torch.ones_like(sens_maps_updated).cuda()
         else:
-            sens_maps_updated, gate = cp.checkpoint(self.SMEB, target_kspace_u, num_low_frequencies, max_img_size, use_reentrant=False)
+            sens_maps_updated, gate = cp.checkpoint(self.SMEB, target_kspace_u, mask, num_low_frequencies, max_img_size, use_reentrant=False)
 
         sens_maps_updated.requires_grad_(True)
 
@@ -161,7 +166,7 @@ class ReconModel(nn.Module):
         target_img_f = utils.sens_reduce(target_kspace_u, sens_maps_updated)
         target_img_f.requires_grad_(True)
 
-        # # # Recurrent blocks for sensitivity map and MR image update
+        # # Recurrent blocks for sensitivity map and MR image update
         # for idx, IRB_ in enumerate(self.recurrent):
         #     if (self.coils != 1) & (idx != 0):
         #         # Checkpoint the SMRB forward pass to reduce memory usage

@@ -16,9 +16,7 @@ import math
 from typing import List, Tuple, Optional
 from model import utils
 import torch.utils.checkpoint as cp
-
-# Transpose blocks were not used in this code originally, so make sure the change is necessary
-from model.CNN import ConvBlock3D, TransposeConvBlock3D
+from fastmri import ifft2c, rss, complex_abs
 
 #########################################################################################################
 # Sensitivity Model
@@ -28,18 +26,20 @@ class SMEB3D(nn.Module):
     """
     Model for learning sensitivity estimation from k-space data.
 
-    This model applies an IFFT to multichannel k-space data and then a U-Net
-    to the coil images to estimate coil sensitivities. It can be used with the
-    end-to-end variational network.
+    This model applies an IFFT to multichannel k-space data and then a 3D U-Net
+    to the coil images to estimate coil sensitivities. 
 
-    Note SensitivityModel is designed for complex input/output only.
+    Note SMEB3D is designed for complex input/output only.
     """
 
     def __init__(
         self,
-        chans: int,
-        sens_steps: int,
-        mask_center: bool = True
+        in_chans: int = 2,
+        out_chans: int = 2,
+        chans: int = 32,
+        num_pools: int = 4,
+        drop_prob: float = 0.0,
+        mask_center: bool = True        
     ):
         """
         Args:
@@ -54,8 +54,11 @@ class SMEB3D(nn.Module):
         self.mask_center = mask_center
 
         self.norm_net = NormNet3D(
-            chans,
-            sens_steps
+            in_chans=in_chans,
+            out_chans=out_chans,
+            chans=chans,
+            num_pools=num_pools,
+            drop_prob=drop_prob,
         )
 
     def forward(
@@ -66,168 +69,57 @@ class SMEB3D(nn.Module):
     ) -> torch.Tensor:
         
         # Calculate the ACS mask before padding
+        ACS_mask = torch.zeros_like(masked_kspace)
+
         if len(num_low_frequencies) == 1:
-            num_low_freq_y = num_low_frequencies[0]
-            center_y = masked_kspace.shape[-1] // 2
-            half_num_low_freq_y = num_low_freq_y // 2
-            ACS_mask = torch.zeros_like(masked_kspace)
-            ACS_mask[..., :, center_y - half_num_low_freq_y: center_y + half_num_low_freq_y] = 1
+            num_low_freq_w = num_low_frequencies[0]
+            center_w = masked_kspace.shape[-2] // 2
+            half_num_low_freq_w = num_low_freq_w // 2
+            ACS_mask[
+                ..., :,
+                center_w - half_num_low_freq_w: center_w + half_num_low_freq_w
+            ] = 1
         
         elif len(num_low_frequencies) == 2:
-            num_low_freq_x, num_low_freq_y = num_low_frequencies
-            center_x, center_y = masked_kspace.shape[-2] // 2, masked_kspace.shape[-1] // 2
-            half_low_freq_x, half_low_freq_y = num_low_freq_x // 2, num_low_freq_y // 2
-            ACS_mask = torch.zeros_like(masked_kspace)
+            num_low_freq_h, num_low_freq_w = num_low_frequencies
+            center_h, center_w = masked_kspace.shape[-3] // 2, masked_kspace.shape[-2] // 2
+            half_low_freq_h, half_low_freq_w = num_low_freq_h // 2, num_low_freq_w // 2
             ACS_mask[
-                ..., center_x - half_low_freq_x: center_x + half_low_freq_x,
-                center_y - half_low_freq_y: center_y + half_low_freq_y
+                ..., center_h - half_low_freq_h: center_h + half_low_freq_h,
+                center_w - half_low_freq_w: center_w + half_low_freq_w
             ] = 1
 
-        
         masked_kspace_padded, original_size = utils.pad_to_max_size(masked_kspace, max_img_size)
         ACS_mask_padded, _ = utils.pad_to_max_size(ACS_mask, max_img_size)
+
         # Apply the padded ACS mask to the padded k-space data
         ACS_kspace_padded = ACS_mask_padded * masked_kspace_padded
+
         # Convert to image space
-        ACS_images_padded = utils.ifft2(ACS_kspace_padded)
+        ACS_images_padded = ifft2c(ACS_kspace_padded)
         
         # Estimate sensitivities independently
-        B, C, T, X, Y = ACS_images_padded.shape
-        batched_channels = ACS_images_padded.reshape(B * C, 1, T, X, Y)  # Keep channels separated
+        b, c, t, h, w, comp = ACS_images_padded.shape
+        batched_c = ACS_images_padded.reshape(b * c, 1, t, h, w, comp)
 
-        sensitivity, gate = self.norm_net(batched_channels)
+        sens, gate = self.norm_net(batched_c)
 
-        gate = gate.reshape(B, C, T, X, Y)
-        sensitivity = sensitivity.reshape(B, C, T, X, Y)
-        sensitivity = sensitivity / (utils.rss(sensitivity) + 1e-12)
-        sensitivity = gate * sensitivity
+        # Reshape back to original dimensions
+        # gate is not complex as we do not want to modulate the real and imaginary parts differently
+        gate = gate.reshape(b, c, t, h, w).unsqueeze(-1)
+        sens = sens.reshape(b, c, t, h, w, comp)
+
+        # Normalize and apply gating
+        sens = sens / (rss(complex_abs(sens), dim=1).unsqueeze(1).unsqueeze(-1) + 1e-12)
+        sens = gate * sens
 
         # NOTE: we will unpad in our model later
         # Unpad the outputs to the original size
-        # sensitivity = utils.unpad_from_max_size(sensitivity, original_size)
+        # sens = utils.unpad_from_max_size(sens, original_size)
         # gate = utils.unpad_from_max_size(gate, original_size)
 
-        return sensitivity, gate
+        return sens, gate
     
-
-#########################################################################################################
-# 3D UNet 
-#########################################################################################################
-
-class UNet3D(nn.Module):
-    """
-    PyTorch implementation of a 3D U-Net model from "3D U-Net: Learning Dense Volumetric Segmentation from Sparse Annotation"
-        - authours: Özgün Çiçek, Ahmed Abdulkadir, Soeren S. Lienkamp, Thomas Brox, Olaf Ronneberger
-        - arXiv:1606.06650
-    """
-    def __init__(
-            self,  
-            in_chans: int = 2,
-            out_chans: int = 2,
-            chans: int = 32, 
-            num_pool_layers: int = 4
-    ):
-        super().__init__()        
-        
-        self.in_chans = in_chans
-        self.out_chans = out_chans
-        self.num_pool_layers = num_pool_layers
-
-        # Initialize the downsampling path
-        self.down_sample_layers = nn.ModuleList([ConvBlock3D(self.in_chans, chans)])
-
-        ch = chans
-
-        for i in range(self.num_pool_layers - 1):
-            self.down_sample_layers.append(ConvBlock3D(ch, ch * 2))
-            ch *= 2
-
-        # Bottleneck layer
-        self.bottleneck = ConvBlock3D(ch, ch * 2)
-
-        # Initialize the upsampling path
-        self.up_sample_layers = nn.ModuleList()
-        self.up_conv_layers = nn.ModuleList()
-
-        for _ in range(self.num_pool_layers - 1):
-            self.up_sample_layers.append(TransposeConvBlock3D(ch * 2, ch))
-            self.up_conv_layers.append(ConvBlock3D(ch * 2, ch))
-            ch //= 2
-
-        self.final_conv = ConvBlock3D(ch * 2, ch)
-        self.norm_conv = nn.Conv3d(ch, self.out_chans, kernel_size=1, stride=1)
-
-        # Gated Convolution
-        self.gate_conv = nn.Conv3d(self.out_chans, 1, kernel_size=1, stride=1)
-        self.scale = nn.Parameter(torch.ones(1))
-        self.shift = nn.Parameter(torch.zeros(1))
-
-        # Learnable Gaussian std
-        self.stds = nn.ParameterList([nn.Parameter(torch.ones(1)) for _ in range(num_pool_layers)])
-
-    def forward(self, image: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            image: Input 5D tensor of shape `(B, in_chans, T, X, Y)`.
-
-        Returns:
-            Output tensor of shape `(B, in_chans, T, X, Y)`.
-        """
-        stack = []
-        output = image
-
-        # Downsampling path
-        for layer in self.down_sample_layers:
-            output = layer(output)
-            stack.append(output)
-            output = F.avg_pool3d(output, kernel_size=2, stride=2, padding=0)
-
-        # Bottleneck
-        output = self.bottleneck(output)
-        cnt = 0
-
-            
-        # Upsampling path
-        for up_sample, up_conv in zip(self.up_sample_layers, self.up_conv_layers):
-            sigma_value = torch.clamp(self.stds[cnt], min=1e-9, max=7)
-            sigma = (0, sigma_value.item(), sigma_value.item())  # No smoothing on the temporal dimension
-            output_ = utils.gaussian_smooth_3d(output.view(-1, 1, *output.shape[-3:]), sigma=sigma)
-            
-            output = output_.view(output.shape)
-            downsample_layer = stack.pop()
-            output = up_sample(output)
-            
-            padding = [0, 0, 0, 0, 0, 0]
-            if output.shape[-1] != downsample_layer.shape[-1]:  # Y dimension
-                padding[0] = 1  # padding right (Y dimension)
-            if output.shape[-2] != downsample_layer.shape[-2]:  # X dimension
-                padding[2] = 1  # padding bottom (X dimension)
-            if output.shape[-3] != downsample_layer.shape[-3]:  # T dimension
-                padding[4] = 1  # padding in the temporal dimension
-
-            if any(padding):
-                output = F.pad(output, padding, "reflect")
-
-            output = torch.cat([output, downsample_layer], dim=1)
-            output = up_conv(output)
-            
-            cnt += 1
-
-        output = self.final_conv(output)
-
-        # Final Gaussian smoothing and norm_conv
-        sigma_value = torch.clamp(self.stds[cnt], min=1e-9, max=7)
-        sigma = (0, sigma_value.item(), sigma_value.item())  # No smoothing on the temporal dimension
-        output_ = utils.gaussian_smooth_3d(output.view(-1, 1, *output.shape[-3:]), sigma=sigma)
-        output = output_.view(output.shape)
-        output = F.interpolate(output, scale_factor=(2**(self.num_pool_layers-3)))
-        output = self.norm_conv(output)
-
-        # Gated Convolution
-        gate = torch.sigmoid(self.scale * (self.gate_conv(output) + self.shift))
-
-        return output, gate
-
 
 #########################################################################################################
 # 3D NormNet
@@ -246,8 +138,11 @@ class NormNet3D(nn.Module):
 
     def __init__(
         self,
+        in_chans: int,
+        out_chans: int,
         chans: int,
-        num_steps: int
+        num_pools: int,
+        drop_prob: float,
     ):
         """
         Args:
@@ -256,108 +151,222 @@ class NormNet3D(nn.Module):
         """
         super().__init__()
         
-        self.NormNet3D = UNet3D(
+        self.unet_3d = UNet3D(
+            in_chans=in_chans,
+            out_chans=out_chans,
             chans=chans,
-            num_pool_layers=num_steps,
+            num_pools=num_pools,
+            drop_prob=drop_prob,
         )
 
 
-    def complex_to_chan_dim(self, image: torch.Tensor) -> torch.Tensor:
-        assert torch.is_complex(image)
-        return torch.cat([image.real, image.imag], dim=1) # Use dim=1 for the channel dimension
-
-
-
-    def chan_dim_to_complex(self, image: torch.Tensor) -> torch.Tensor:
-        assert not torch.is_complex(image)
-        _, C, _, _, _ = image.shape
-        assert C % 2 == 0
-        C = C // 2
-        return torch.complex(image[:, :C], image[:, C:])  # Use dim=1 for the channel dimension
-
-
-
-    def norm(self, image: torch.Tensor):
+    def norm(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # group norm
-        B, C, T, X, Y = image.shape
-        assert C % 2 == 0
-        image = image.view(B, 2, C // 2 * T * X * Y)
+        b, c, t, h, w = x.shape
+        x = x.view(b, 2, c // 2 * t * h * w)
 
-        mean = image.mean(dim=2).view(B, 2, 1)
-        std = image.std(dim=2).view(B, 2, 1)
+        mean = x.mean(dim=2).view(b, 2, 1, 1, 1)
+        std = x.std(dim=2).view(b, 2, 1, 1, 1)
 
-        image = (image - mean) / (std + 1e-12)
+        x = x.view(b, c, t, h, w)
 
-        return image.view(B, C, T, X, Y), mean, std
+        return (x - mean) / std, mean, std
 
 
-    def unnorm(self, image: torch.Tensor, mean: torch.Tensor, std: torch.Tensor):
-        B, C, T, X, Y = image.shape
-        assert C % 2 == 0
-        image = image.contiguous().view(B, 2, C // 2 * T * X * Y)
-        image = image * std + mean
-        return image.view(B, C, T, X, Y)
-
+    def unnorm(
+        self, x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor
+    ) -> torch.Tensor:
+        return x * std + mean
+    
 
     def pad(
-        self, image: torch.Tensor
+        self, x: torch.Tensor
     ) -> Tuple[torch.Tensor, Tuple[List[int], List[int], List[int], int, int, int]]:
-        _, _, T, X, Y = image.shape
+        _, _, t, h, w = x.shape
 
         # Calculate the multiples to align to the nearest multiple of 16
-        T_mult = ((T - 1) | 15) + 1
-        X_mult = ((X - 1) | 15) + 1
-        Y_mult = ((Y - 1) | 15) + 1
+        t_mult = ((t - 1) | 15) + 1
+        h_mult = ((h - 1) | 15) + 1
+        w_mult = ((w - 1) | 15) + 1
 
         # Calculate padding required for each dimension
-        T_pad = [math.floor((T_mult - T) / 2), math.ceil((T_mult - T) / 2)]
-        X_pad = [math.floor((X_mult - X) / 2), math.ceil((X_mult - X) / 2)]
-        Y_pad = [math.floor((Y_mult - Y) / 2), math.ceil((Y_mult - Y) / 2)]
+        t_pad = [math.floor((t_mult - t) / 2), math.ceil((t_mult - t) / 2)]
+        h_pad = [math.floor((h_mult - h) / 2), math.ceil((h_mult - h) / 2)]
+        w_pad = [math.floor((w_mult - w) / 2), math.ceil((w_mult - w) / 2)]
 
         # Apply padding
-        image = F.pad(image, Y_pad + X_pad + T_pad)
+        x = F.pad(x, w_pad + h_pad + t_pad)
 
-        return image, (T_pad, X_pad, Y_pad, T_mult, X_mult, Y_mult)
+        return x, (t_pad, h_pad, w_pad, t_mult, h_mult, w_mult)
 
 
     def unpad(
         self,
-        image: torch.Tensor,
-        T_pad: List[int],
-        X_pad: List[int],
-        Y_pad: List[int],
-        T_mult: int,
-        X_mult: int,
-        Y_mult: int,
+        x: torch.Tensor,
+        t_pad: List[int],
+        h_pad: List[int],
+        w_pad: List[int],
+        t_mult: int,
+        h_mult: int,
+        w_mult: int,
     ) -> torch.Tensor:
-        return image[..., T_pad[0]: T_mult - T_pad[1], X_pad[0]: X_mult - X_pad[1], Y_pad[0]: Y_mult - Y_pad[1]]
+        return x[..., t_pad[0]: t_mult - t_pad[1], h_pad[0]: h_mult - h_pad[1], w_pad[0]: w_mult - w_pad[1]]
 
 
     def forward(
         self, 
-        image: torch.Tensor,
-        ref: Optional[torch.Tensor] = None,
+        x: torch.Tensor,
     ) -> torch.Tensor:
         
-        assert len(image.shape) == 5
-        assert torch.is_complex(image)
+        if not x.shape[-1] == 2:
+            raise ValueError("Last dimension must be 2 for complex.")
 
         # Convert to real-valued tensor and normalize
-        image = self.complex_to_chan_dim(image)
-        image, mean, std = self.norm(image)
-        image, pad_sizes = self.pad(image)
-            
+        x = utils.complex_to_chan_dim(x)
+        x, mean, std = self.norm(x)
+        x, pad_sizes = self.pad(x)
+
         # Pass through UNet3D (NormNet3D)
-        image, gate = self.NormNet3D(image)
+        x, gate = self.unet_3d(x)
         gate = self.unpad(gate, *pad_sizes)
         
         # Unnormalize and convert back to complex
-        image = self.unpad(image, *pad_sizes)
-        image = self.unnorm(image, mean, std)
-        image = self.chan_dim_to_complex(image)
+        x = self.unpad(x, *pad_sizes)
+        x = self.unnorm(x, mean, std)
+        x = utils.chan_complex_to_last_dim(x)
 
-        return image, gate
+        return x, gate
     
+
+#########################################################################################################
+# 3D UNet 
+#########################################################################################################
+
+class UNet3D(nn.Module):
+    """
+    PyTorch implementation of a 3D U-Net model.
+
+    Çiçek, , Abdulkadir, A., Lienkamp, S.S., Brox, T., Ronneberger, O.: 3d u-net:
+    Learning dense volumetric segmentation from sparse annotation. Proceedings of
+    MICCAI pp. 424–432 (2016). https://doi.org/10.1007/978-3-319-46723-8_49
+    """
+
+    def __init__(
+        self,
+        in_chans: int,
+        out_chans: int,
+        chans: int,
+        num_pools: int,
+        drop_prob: float,
+    ):
+        super().__init__()
+
+        self.in_chans = in_chans
+        self.out_chans = out_chans
+        self.chans = chans
+        self.num_pools = num_pools
+        self.drop_prob = drop_prob
+
+        # Initialize the downsampling path
+        self.down_sample_layers = nn.ModuleList([ConvBlock3D(in_chans, chans, drop_prob)])
+        ch = chans
+
+        for _ in range(self.num_pools - 1):
+            self.down_sample_layers.append(ConvBlock3D(ch, ch * 2, drop_prob))
+            ch *= 2
+
+        self.conv = ConvBlock3D(ch, ch * 2, drop_prob)
+
+        # Initialize the upsampling path
+        self.up_conv = nn.ModuleList()
+        self.up_transpose_conv = nn.ModuleList()
+
+        for _ in range(self.num_pools - 1):
+            self.up_transpose_conv.append(TransposeConvBlock3D(ch * 2, ch))
+            self.up_conv.append(ConvBlock3D(ch * 2, ch, drop_prob))
+            ch //= 2
+
+
+        self.conv_sl = ConvBlock3D(ch*2, ch, drop_prob)
+        self.norm_conv = nn.Conv3d(ch, self.out_chans, kernel_size=1, stride=1)
+
+        # Gated Convolution
+        self.scale = nn.Parameter(torch.ones(1))
+        self.shift = nn.Parameter(torch.zeros(1))
+        self.gate_conv = nn.Conv3d(ch, 1, kernel_size=1, stride=1)
+
+        # Learnable Gaussian std
+        self.stds = nn.ParameterList([nn.Parameter(torch.ones(1)) for _ in range(num_pools)])
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            image: Input 5D tensor of shape `(B, in_chans, T, H, W)`.
+
+        Returns:
+            Output tensor of shape `(B, in_chans, T, H, W)`.
+        """
+        stack = []
+        output = image
+
+        # Downsampling path
+        for layer in self.down_sample_layers:
+            output = layer(output)
+            stack.append(output)
+            output = F.avg_pool3d(output, kernel_size=2, stride=2, padding=0)
+
+        # Bottleneck
+        output = self.conv(output)
+        cnt = 0
+            
+        # Upsampling path
+        for transpose_conv, up_conv in zip(self.up_transpose_conv, self.up_conv):
+
+            #### learnable Gaussian std ####
+            sigma_value = torch.clamp(self.stds[cnt], min=1e-9, max=7)
+            sigma = (0, sigma_value.item(), sigma_value.item())  # No smoothing on the temporal dimension
+            output_ = utils.gaussian_smooth_3d(output.view(-1, 1, *output.shape[-3:]), sigma=sigma)
+            output = output_.view(output.shape)
+
+            downsample_layer = stack.pop()
+            output = transpose_conv(output)
+            
+            padding = [0, 0, 0, 0, 0, 0]
+            if output.shape[-1] != downsample_layer.shape[-1]:
+                padding[1] = 1  # padding W dimension
+            if output.shape[-2] != downsample_layer.shape[-2]:  
+                padding[3] = 1  # padding H dimension
+            if output.shape[-3] != downsample_layer.shape[-3]: 
+                padding[5] = 1  # padding T dimension
+
+            if any(padding):
+                output = F.pad(output, padding, "reflect")
+
+            output = torch.cat([output, downsample_layer], dim=1)
+            output = up_conv(output)
+
+            cnt += 1
+
+        output = self.conv_sl(output)
+
+        #### learnable Gaussian std ####
+        sigma_value = torch.clamp(self.stds[cnt], min=1e-9, max=7)
+        sigma = (0, sigma_value.item(), sigma_value.item())  # No smoothing on the temporal dimension
+        output_ = utils.gaussian_smooth_3d(output.view(-1, 1, *output.shape[-3:]), sigma=sigma)
+        output = output_.view(output.shape)
+
+        # TODO: This is a little ugly, need to adjust the hardcoding
+        output = F.interpolate(output, scale_factor=2**(self.num_pools-3), mode='trilinear', align_corners=True)
+
+        #### normal ####
+        norm_conv = self.norm_conv(output)
+
+        #### gated ####
+        gate_conv = torch.sigmoid(self.scale * (self.gate_conv(output) + self.shift))
+
+        return norm_conv, gate_conv
+
+
 
 #########################################################################################################
 # 3D Convolution 
@@ -369,30 +378,42 @@ class ConvBlock3D(nn.Module):
     instance normalization and LeakyReLU activation.
     """
 
-    def __init__(self, in_chans: int, out_chans: int):
+    def __init__(
+        self, 
+        in_chans: int,
+        out_chans: int, 
+        drop_prob: float
+    ):
         """
         Args:
             in_chans: Number of channels in the input.
             out_chans: Number of channels in the output.
+            drop_prob: Dropout probability.
         """
         super().__init__()
 
         self.in_chans = in_chans
         self.out_chans = out_chans
+        self.drop_prob = drop_prob
 
         self.layers = nn.Sequential(
             nn.Conv3d(in_chans, out_chans, kernel_size=3, stride=1, padding=1, bias=False),
             nn.InstanceNorm3d(out_chans),
-            nn.LeakyReLU(negative_slope=0.2, inplace=True)
+            nn.LeakyReLU(negative_slope=0.2, inplace=True),
+            nn.Dropout3d(drop_prob),
+            nn.Conv3d(out_chans, out_chans, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.InstanceNorm3d(out_chans),
+            nn.LeakyReLU(negative_slope=0.2, inplace=True),
+            nn.Dropout3d(drop_prob),
         )
 
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            image: Input 5D tensor of shape `(B, in_chans, T, X, Y)`.
+            image: Input 5D tensor of shape `(B, in_chans, T, H, W)`.
 
         Returns:
-            Output tensor of shape `(B, out_chans, T, X, Y)`.
+            Output tensor of shape `(B, out_chans, T, H, W)`.
         """
         return self.layers(image)
 
@@ -419,7 +440,7 @@ class TransposeConvBlock3D(nn.Module):
         self.out_chans = out_chans
 
         self.layers = nn.Sequential(
-            nn.ConvTranspose3d(in_chans, out_chans, kernel_size=3, stride=2, padding=1, output_padding=1, bias=False),
+            nn.ConvTranspose3d(in_chans, out_chans, kernel_size=2, stride=2, padding=1, output_padding=1, bias=False),
             nn.InstanceNorm3d(out_chans),
             nn.LeakyReLU(negative_slope=0.2, inplace=True),
         )
@@ -427,10 +448,10 @@ class TransposeConvBlock3D(nn.Module):
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            image: Input 5D tensor of shape `(B, C, T, X, Y)`.
+            image: Input 5D tensor of shape `(B, in_chans, T, H, W)`.
 
         Returns:
-            Output tensor of shape `(B, out_chans, T*2, X*2, Y*2)`.
+            Output tensor of shape `(B, out_chans, T*2, H*2, W*2)`.
         """
         return self.layers(image)
     
@@ -445,131 +466,48 @@ class ConvBlockSM3D(nn.Module):
     instance normalization, LeakyReLU activation, and spatiotemporal attention.
     """
 
-    def __init__(self, in_chans=2, conv_num=0, out_chans=None, max_chans=None):
+    def __init__(
+        self, 
+        in_chans: int = 2, 
+        out_chans: int = 2, 
+        drop_prob: float = 0.0
+    ):
         """
         Args:
             in_chans: Number of channels in the input.
             out_chans: Number of channels in the output.
+            drop_prob: Dropout probability.
         """
         super().__init__()
 
-        self.in_chans = in_chans
-        self.chans_max = max_chans or in_chans
-        self.out_chans = out_chans or in_chans
-
-        self.layers = []
-        self.layers.append(nn.Sequential(
-            nn.Conv3d(self.in_chans, self.chans_max, kernel_size=3, padding=1, bias=False),
-            nn.InstanceNorm3d(self.chans_max),
-            nn.LeakyReLU(negative_slope=0.2, inplace=True)
+        self.layers = (nn.Sequential(
+            nn.Conv3d(in_chans, out_chans, kernel_size=3, padding=1, bias=False),
+            nn.InstanceNorm3d(out_chans),
+            nn.LeakyReLU(negative_slope=0.2, inplace=True),
+            nn.Dropout3d(drop_prob),
+            nn.Conv3d(out_chans, out_chans, kernel_size=3, padding=1, bias=False),
+            nn.InstanceNorm3d(out_chans),
+            nn.LeakyReLU(negative_slope=0.2, inplace=True),
+            nn.Dropout3d(drop_prob),
         ))
 
         #### Spatiotemporal Attention ####
-        self.STA = SpatiotemporalAttention(in_channels=self.in_chans)
-
-        for index in range(conv_num):
-            if index == conv_num - 1:
-                self.layers.append(nn.Sequential(
-                    nn.Conv3d(self.chans_max, self.out_chans, kernel_size=3, padding=1, bias=False),
-                    nn.InstanceNorm3d(self.in_chans),
-                    nn.LeakyReLU(negative_slope=0.2, inplace=True)
-                ))
-            else:
-                self.layers.append(nn.Sequential(
-                    nn.Conv3d(self.chans_max, self.chans_max, kernel_size=3, padding=1, bias=False),
-                    nn.InstanceNorm3d(self.chans_max),
-                    nn.LeakyReLU(negative_slope=0.2, inplace=True)
-                ))
-
-        self.body = nn.Sequential(*self.layers)
+        self.STA = SpatiotemporalAttention(in_channels=in_chans)
 
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            image: Input 5D tensor of shape `(B, C, T, X, Y)`.
+            image: Input 5D tensor of shape `(B, C, T, H, W)`.
 
         Returns:
-            Output tensor of shape `(B, out_chans, T, X, Y)`.
+            Output tensor of shape `(B, out_chans, T, H, W)`.
         """
-        output = self.body(image)
-        output = output + image[:, :2, :, :, :]  # Adjusted to C first dimension
-        
+        output = self.layers(image)
+
         #### Spatiotemporal Attention ###
         output = self.STA(output) * output
 
         return output
-
-#########################################################################################################
-# 2D+t SM Convolution w/ Spatiotemporal Attention (Modified)
-#########################################################################################################
-
-class ConvBlockSM2D_t(nn.Module):
-    """
-    A Convolutional Block that consists of convolution layers each followed by
-    instance normalization, LeakyReLU activation, and spatiotemporal attention.
-    """
-    def __init__(self, in_chans=2, conv_num=0, out_chans=None, max_chans=None):
-        super().__init__()
-
-        self.in_chans = in_chans
-        self.chans_max = max_chans or in_chans
-        self.out_chans = out_chans or in_chans
-
-        # List to store the blocks with both spatial and temporal convolutions
-        self.layers = nn.ModuleList()
-
-        for index in range(conv_num):
-            current_out_chans = self.out_chans if index == conv_num - 1 else self.chans_max
-            self.layers.append(self._create_conv_block(self.chans_max if index > 0 else in_chans, current_out_chans))
-
-        # Spatiotemporal Attention
-        self.STA = SpatiotemporalAttention(in_channels=self.in_chans)
-
-    def _create_conv_block(self, in_channels, out_channels):
-        """
-        Helper function to create a block of spatial and temporal convolutions.
-        Each block applies a spatial convolution followed by a temporal convolution,
-        then normalization and activation for both.
-        """
-        return nn.Sequential(
-            # Spatial Convolution (2D)
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.InstanceNorm2d(out_channels),
-            nn.LeakyReLU(negative_slope=0.2, inplace=True),
-
-            # Temporal Convolution (1D)
-            nn.Conv1d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.InstanceNorm1d(out_channels),
-            nn.LeakyReLU(negative_slope=0.2, inplace=True)
-        )
-
-    def forward(self, image):
-        # image: B, C, T, X, Y
-        B, C, T, X, Y = image.shape
-        input_image = image
-
-        for layer in self.layers:
-            # Apply spatial convolution (2D)
-            image = image.permute(0, 2, 1, 3, 4).reshape(B * T, C, X, Y)  # Reshape to (B * T, C, X, Y)
-            image = layer[0](image)  # Apply Conv2d
-            image = layer[1](image)  # InstanceNorm2d
-            image = layer[2](image)  # LeakyReLU
-            image = image.reshape(B, T, C, X, Y).permute(0, 2, 1, 3, 4)  # Reshape back to (B, C, T, X, Y)
-
-            # Apply temporal convolution (1D)
-            image = image.permute(0, 3, 4, 1, 2).reshape(B * X * Y, C, T)  # Reshape to (B * X * Y, C, T)
-            image = layer[3](image)  # Apply Conv1d
-            image = layer[4](image)  # InstanceNorm1d
-            image = layer[5](image)  # LeakyReLU
-            image = image.reshape(B, X, Y, C, T).permute(0, 3, 4, 1, 2).contiguous()  # Reshape back to (B, C, T, X, Y)
-
-        # Skip connection - Add the input to the output
-        image = image + input_image[:, :2, :, :, :]  # Adjusting to add only the first 2 channels of the input
-
-        # Apply spatiotemporal attention
-        image = self.STA(image) * image  
-
-        return image
 
 
 #########################################################################################################

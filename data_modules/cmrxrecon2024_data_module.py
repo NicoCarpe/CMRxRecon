@@ -12,13 +12,13 @@ import torch
 import os
 
 import fastmri
-from data_utils.mri_datasets import CombinedCmrxReconSliceDataset2024, CmrxReconSliceDataset2024
+from data_utils.dataset_cmrxrecon2024 import CombinedVolumeDataset, VolumeDataset
 
 def worker_init_fn(worker_id):
     """Handle random seeding for all mask_func."""
     worker_info = torch.utils.data.get_worker_info()
     data: Union[
-        CmrxReconSliceDataset2024, CombinedCmrxReconSliceDataset2024
+        VolumeDataset, CombinedVolumeDataset
     ] = worker_info.dataset  # pylint: disable=no-member
 
     # Check if we are using DDP (Distributed Data Parallel)
@@ -30,7 +30,7 @@ def worker_init_fn(worker_id):
     # for NumPy random seed we need it to be in this range
     base_seed = worker_info.seed  # pylint: disable=no-member
 
-    if isinstance(data, CombinedCmrxReconSliceDataset2024):
+    if isinstance(data, CombinedVolumeDataset):
         for i, dataset in enumerate(data.datasets):
             if dataset.transform.mask_func is not None:
                 if is_ddp:
@@ -175,9 +175,10 @@ class CmrxReconDataModule(pl.LightningDataModule):
 
         # Combine train and val data if specified
         if is_train and self.combine_train_val:
+            # TODO: This needs to be fixed to account for new train/val splits
             data_partitions = ["train", "val"]
             data_paths = [self.data_path, self.data_path]
-            data_transforms = [data_transform, data_transform]
+            data_transforms = [self.train_transform, self.val_transform]
             challenges = [self.challenge, self.challenge]
 
             # Prepare sampling rates for combined dataset
@@ -187,25 +188,20 @@ class CmrxReconDataModule(pl.LightningDataModule):
             if volume_sample_rate is not None:
                 volume_sample_rates = [volume_sample_rate, volume_sample_rate]
 
-            dataset = CombinedCmrxReconSliceDataset2024(
+            dataset = CombinedVolumeDataset(
                 roots=data_paths,
                 transforms=data_transforms,
                 challenges=challenges,
                 sample_rates=sample_rates,
                 volume_sample_rates=volume_sample_rates,
                 use_dataset_cache=self.use_dataset_cache_file,
-                raw_sample_filter=raw_sample_filter,
-                data_partitions=data_partitions
+                raw_sample_filter=raw_sample_filter
             )
         else:
-            # Load specific data partition (train or val)
-            data_path = self.data_path
-
-            dataset = CmrxReconSliceDataset2024(
-                root=data_path,
+            dataset = VolumeDataset(
+                root=self.data_path,
                 challenge=self.challenge,
-                data_partition=data_partition,
-                transform=data_transform,
+                transform=self.train_transform if data_partition == "train" else self.val_transform,
                 use_dataset_cache=self.use_dataset_cache_file,
                 sample_rate=sample_rate,
                 volume_sample_rate=volume_sample_rate,
@@ -229,6 +225,7 @@ class CmrxReconDataModule(pl.LightningDataModule):
             dataset=dataset,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
+            persistent_workers=True,
             sampler=sampler,
             shuffle=is_train if sampler is None else False,
             pin_memory=True,  # Recommended if you're using a GPU
@@ -244,10 +241,9 @@ class CmrxReconDataModule(pl.LightningDataModule):
 
             for data_partition in data_partitions:
                 # Use the base path without modification
-                _ = CmrxReconSliceDataset2024(
+                _ = VolumeDataset(
                     root=self.data_path,  # Use the base path directly
                     challenge=self.challenge,
-                    data_partition=data_partition,
                     transform=self.train_transform if data_partition == "train" else self.val_transform,
                     sample_rate=self.sample_rate,
                     volume_sample_rate=self.volume_sample_rate,

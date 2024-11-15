@@ -3,13 +3,14 @@ import sys
 import shutil
 import argparse
 import numpy as np
-from data_utils.cmrxrecon2024.utils import zf_recon
+from data_utils.cmrxrecon2024.utils import load_kdata
 import h5py
 import glob
 from os.path import join
 from tqdm import tqdm
 
-def split_train_val(h5_folder, train_num=100):
+def split_train_val(h5_folder, train_num=100):\
+    # NOTE: This seems to put the train folder within the val folder for some reason
     train_folder = join(h5_folder, 'train')
     val_folder = join(h5_folder, 'val')
 
@@ -26,8 +27,8 @@ def split_train_val(h5_folder, train_num=100):
         full_case_folder = join(h5_folder, case_folder)
 
         # Skip if the folder is 'train' or 'val'
-        if case_folder in ['train', 'val']:
-            continue
+        # if case_folder in ['train', 'val']:
+        #     continue
 
         case_count += 1
 
@@ -96,44 +97,30 @@ if __name__ == '__main__':
         
         # Check if the processed file already exists
         if os.path.exists(save_path):
-            #print(f"skip {save_path}")
             continue  # Skip to the next file
 
         if not os.path.isdir(os.path.dirname(save_path)):
             os.makedirs(os.path.dirname(save_path))
         filename = os.path.basename(ff)
 
-        # Load k-space and image data using zf_recon (assuming output shape: kdata=(nx,ny,nc,nz,nt), image=(nx,ny,nz,nt))
-        kdata, image = zf_recon(ff)
+        # Load k-space data: (nt, nz, nc, ny, nx, 2)
+        kdata = load_kdata(ff)
+
+        # for ease we will rearrange to (nc, nt, nx, ny, nz, 2)
+        kdata = kdata.transpose(2,0,4,3,1,5)
 
         # Save the data to an h5py file
         with h5py.File(save_path, 'w') as file:
-            # TODO: these transposes were done poorly to fit the rest of the project
-            
-            # Transpose the k-space data to match fastMRI format
-            # Original shape: (nx, ny, nc, nz, nt)
-            # Transposed shape: (nc, nx, ny, nt, nz)
-            save_kdata = kdata.transpose(2, 0, 1, 4, 3)
-            
-            # Transpose the image data to match fastMRI format
-            # Original shape: (nx, ny, nz, nt)
-            # Transposed shape: (nz, nx, ny, nt)
-            save_image = image.transpose(2, 0, 1, 3)
-
             # Create datasets in the h5py file
-            file.create_dataset('kspace', data=save_kdata)
-            file.create_dataset('reconstruction_rss', data=save_image)
+            file.create_dataset('kspace', data=kdata)
 
             # Compute and store attributes
             attrs = {
-                'max': image.max(),
-                'norm': np.linalg.norm(image),
+                'max': kdata.max(),
                 'patient_id': save_path.split(save_folder_name)[-1][0:3],
-                'shape': save_kdata.shape,  # (nc, nx, ny, nt, nz)
+                'shape': kdata.shape,  # (nc, nt, nx, ny, nz, 2)
                 'padding_left': 0,
-                'padding_right': save_kdata.shape[4],  # This refers to the nz dimension
-                'encoding_size': (save_kdata.shape[3], save_kdata.shape[4], 1),  # (nt, nz, 1)
-                'recon_size': (save_kdata.shape[3], save_kdata.shape[4], 1),  # (nt, nz, 1)
+                'padding_right': kdata.shape[4],  # This refers to the nz dimension
                 'masks': save_path.replace(f"save_folder_name", f"Mask_Task{task}")
             }
 
@@ -148,10 +135,10 @@ if __name__ == '__main__':
 
     # Case Totals:
 
-    # Aorta cases:  155
-    # Cine cases:  196
-    # Mapping cases:  193
-    # Tagging cases:  143
+    # Aorta cases:  155 , Aorta files:  305
+    # Cine cases:  196 , Cine files:  566
+    # Mapping cases:  193 , Mapping files:  386
+    # Tagging cases:  143 , Tagging files:  143
 
     # Create a 160:50 train val split
     split_train_val(aorta_h5_folder, train_num=124)         

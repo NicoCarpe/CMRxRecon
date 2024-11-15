@@ -1,11 +1,11 @@
 #!/bin/bash -l
 #SBATCH -J cmrxrecon_train
-#SBATCH --time=1:20:00
+#SBATCH --time=9:00:00
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=2
-#SBATCH --gpus-per-node=v100l:2            
-#SBATCH --cpus-per-task=2                  
-#SBATCH --mem=96GB                                                 
+#SBATCH --ntasks-per-node=1                # 4 tasks per node (1 per GPU)
+#SBATCH --gpus-per-node=v100l:1            # 4 GPUs per node
+#SBATCH --cpus-per-task=8                  # Request 8 CPUs per task (adjust if needed)
+#SBATCH --mem=128GB                        # Request 128GB of memory                            
 #SBATCH --account=def-punithak
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=ngcarpen@ualberta.ca
@@ -13,7 +13,7 @@
 #SBATCH --error=slurm_logs/err/%x_%j.err
 
 export HDF5_USE_FILE_LOCKING=FALSE
-export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
+export OMP_NUM_THREADS=6
 
 # Set PROJECT_ROOT and PYTHONPATH
 export PROJECT_ROOT=/home/nicocarp/scratch/CMR-Reconstruction
@@ -54,15 +54,6 @@ if [ ! -f "$config" ]; then
     exit 1
 fi
 
-# Extract the run_preprocessing flag from the YAML config
-run_preprocessing=$(python -c "import yaml; print(yaml.safe_load(open('$config'))['run_preprocessing'])")
-echo "Running preprocessing: $run_preprocessing"
+srun python $PROJECT_ROOT/data_utils/cmrxrecon2024/preprocess_cmrxrecon2024.py --data_path $PROJECT_ROOT/datasets/CMR_2024/ChallengeData/MultiCoil/ --h5py_folder h5_FullSample/
 
-# Check if the run_preprocessing flag is set to True
-if [ "$run_preprocessing" = "True" ]; then
-    srun python $PROJECT_ROOT/data_utils/cmrxrecon2024/preprocess_cmrxrecon2024.py --data_path $PROJECT_ROOT/datasets/CMR_2024/ChallengeData/MultiCoil/ --h5py_folder h5_FullSample/
-fi
 
-# Run training
-echo "Running training"
-srun python $PROJECT_ROOT/training/train_cmrxrecon2024.py --config $config

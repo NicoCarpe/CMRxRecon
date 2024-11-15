@@ -16,6 +16,7 @@ from torch.profiler import schedule, tensorboard_trace_handler, ProfilerActivity
 
 def cli_main(args):
     pl.seed_everything(args.seed)
+    output_dir = Path(args.output_dir)
 
     # ------------
     # data
@@ -45,11 +46,10 @@ def cli_main(args):
     # ------------
     # logger
     # ------------
-    output_dir = Path(args.output_dir) / "logs"
     logger = TensorBoardLogger(
-        save_dir=output_dir, 
-        name="ReconMRI",
-        log_graph=True
+        save_dir = output_dir, 
+        name = "logs",
+        log_graph = True
     )
 
     # ------------
@@ -57,15 +57,13 @@ def cli_main(args):
     # ------------
     
     profiler = PyTorchProfiler(
-        dirpath=output_dir / "profile",
-        filename="profiler_trace",
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],  # Capture both CPU and GPU
-        schedule=schedule(wait=1, warmup=1, active=5, repeat=2),
-        on_trace_ready=tensorboard_trace_handler(output_dir / "profile"),
-        with_stack=True,
-        profile_memory=True,  # Capture memory usage
-        record_shapes=True  # Record tensor shapes
-)
+        dirpath = output_dir / "profile",
+        filename = "profiler_trace",
+        activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        schedule = schedule(wait=1, warmup=1, active=2, repeat=1),
+        on_trace_ready = tensorboard_trace_handler(output_dir / "profile")
+    )
+
 
     # ------------
     # checkpoint callback
@@ -73,7 +71,7 @@ def cli_main(args):
     args.callbacks = [
         ModelCheckpoint(
             dirpath=args.checkpoint_dir,
-            save_top_k=-1,  # Save only the best model
+            save_top_k=1,  # Save only the best model
             verbose=True,
             monitor="validation_loss",
             mode="min"
@@ -113,11 +111,8 @@ def cli_main(args):
     # ------------
     trainer.fit(model, datamodule=data_module, ckpt_path=resume_checkpoint_path)
 
-    # Print CPU times
-    print(profiler.key_averages().table(sort_by="cpu_time_total"), flush=True)
-
-    # Print GPU times
-    print(profiler.key_averages().table(sort_by="cuda_time_total"), flush=True)
+    # Instead of key_averages()
+    print(profiler.summary(), flush=True)
 
 def build_args():
     parser = ArgumentParser()

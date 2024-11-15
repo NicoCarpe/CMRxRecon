@@ -1,11 +1,11 @@
 #!/bin/bash -l
 #SBATCH -J cmrxrecon_train
-#SBATCH --time=1:20:00
+#SBATCH --time=4:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=2
 #SBATCH --gpus-per-node=v100l:2            
 #SBATCH --cpus-per-task=2                  
-#SBATCH --mem=96GB                                                 
+#SBATCH --mem=64GB                                                 
 #SBATCH --account=def-punithak
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=ngcarpen@ualberta.ca
@@ -16,9 +16,12 @@ export HDF5_USE_FILE_LOCKING=FALSE
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
 # Set PROJECT_ROOT and PYTHONPATH
-export PROJECT_ROOT=/home/nicocarp/scratch/CMR-Reconstruction
+export PROJECT_ROOT=/home/nicocarp/scratch/CMRxRecon
 export PYTHONPATH=$PROJECT_ROOT:$PYTHONPATH
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+export CHALLENGE=multicoil
+export DATA=/home/nicocarp/scratch/CMR-Reconstruction/datasets/CMR_2024/ChallengeData/MultiCoil
 
 
 config=$PROJECT_ROOT/configs/train_config.yaml
@@ -48,21 +51,6 @@ pip install --no-index -r $PROJECT_ROOT/configs/requirements_local.txt
 # Install packages from PyPI or other sources
 pip install -r $PROJECT_ROOT/configs/requirements_pypi.txt
 
-# Verify the configuration file exists
-if [ ! -f "$config" ]; then
-    echo "Configuration file $config not found!"
-    exit 1
-fi
-
-# Extract the run_preprocessing flag from the YAML config
-run_preprocessing=$(python -c "import yaml; print(yaml.safe_load(open('$config'))['run_preprocessing'])")
-echo "Running preprocessing: $run_preprocessing"
-
-# Check if the run_preprocessing flag is set to True
-if [ "$run_preprocessing" = "True" ]; then
-    srun python $PROJECT_ROOT/data_utils/cmrxrecon2024/preprocess_cmrxrecon2024.py --data_path $PROJECT_ROOT/datasets/CMR_2024/ChallengeData/MultiCoil/ --h5py_folder h5_FullSample/
-fi
-
 # Run training
 echo "Running training"
-srun python $PROJECT_ROOT/training/train_cmrxrecon2024.py --config $config
+srun python $PROJECT_ROOT/train/train_unet.py --challenge CHALLENGE --data_path DATA
