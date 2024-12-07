@@ -6,14 +6,14 @@ data_path: /home/nicocarp/scratch/CMR-Reconstruction/datasets/CMR_2024/Challenge
 output_dir: /home/nicocarp/scratch/CMR-Reconstruction/outputs/
 checkpoint_dir: /home/nicocarp/scratch/CMR-Reconstruction/pretrained_models/
 challenge: 'multicoil'
-num_workers: 8
+num_workers: 4 # recommended when gpus = 2, try 8 if gpus = 4
 run_preprocessing: false
 resume_from_checkpoint: false
 
 # Model parameters
 coils: 10
 num_heads: [3, 6, 9, 12]
-window_size: [2, 4, 4]
+window_size: [2, 8, 8]
 depths: [2, 2, 6, 2]
 embed_dim: 96
 use_amp: True
@@ -24,7 +24,7 @@ beta: 0.5
 lambda_SM: 0.3   
 
 # Training parameters
-max_epochs: 2   # set to 8-12 for full training
+max_epochs: 12   
 gradient_clip_val: 0.01
 use_checkpoint: True
 accumulate_grad_batches: 1  # for gradient accumulation in ddp

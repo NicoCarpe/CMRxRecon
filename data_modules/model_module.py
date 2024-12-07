@@ -21,7 +21,7 @@ import pytorch_lightning as pl
 
 from fastmri import rss, complex_abs, ifft2c, evaluate, save_reconstructions
 
-from model.model_2d_series import ReconModel
+from model.model import ReconModel
 from model.utils import ssimloss, combined_loss, sens_expand
 
 
@@ -91,18 +91,20 @@ class ReconMRIModule(pl.LightningModule):
     
         # New Shape: (B, T, H, W)
         target_img = rss(complex_abs(ifft2c(target_k)), dim=1)
-        rec_img = rss(complex_abs(ifft2c(rec_img)), dim=1)
+        rec_img = rss(complex_abs(rec_img), dim=1)
+
+        loss = ssimloss(target_img, rec_img, attrs['max'])
 
         # Compute combined loss
-        loss = combined_loss(
-            target_img=target_img,
-            rec_img=rec_img,
-            max_val=attrs['max'],
-            loss_sc = loss_sensitivity_consistency, 
-            alpha=self.hparams.alpha,
-            beta=self.hparams.beta,
-            lambda_SM=self.hparams.lambda_SM,
-        )
+        # loss = combined_loss(
+        #     target_img=target_img,
+        #     rec_img=rec_img,
+        #     max_val=attrs['max'],
+        #     loss_sc = loss_sensitivity_consistency, 
+        #     alpha=self.hparams.alpha,
+        #     beta=self.hparams.beta,
+        #     lambda_SM=self.hparams.lambda_SM,
+        # )
 
         
 
@@ -145,18 +147,20 @@ class ReconMRIModule(pl.LightningModule):
     
         # New Shape: (B, T, H, W)
         target_img = rss(complex_abs(ifft2c(target_k)), dim=1)
-        rec_img = rss(complex_abs(ifft2c(rec_img)), dim=1)
+        rec_img = rss(complex_abs(rec_img), dim=1)
+
+        val_loss = ssimloss(target_img, rec_img, attrs['max'])
 
         # Compute combined loss
-        val_loss = combined_loss(
-            target_img=target_img,
-            rec_img=rec_img,
-            max_val=attrs["max"],
-            loss_sc =  loss_sensitivity_consistency,
-            alpha=self.hparams.alpha,
-            beta=self.hparams.beta,
-            lambda_SM=self.hparams.lambda_SM,
-        )
+        # val_loss = combined_loss(
+        #     target_img=target_img,
+        #     rec_img=rec_img,
+        #     max_val=attrs["max"],
+        #     loss_sc =  loss_sensitivity_consistency,
+        #     alpha=self.hparams.alpha,
+        #     beta=self.hparams.beta,
+        #     lambda_SM=self.hparams.lambda_SM,
+        # )
 
         # Check output and target dimensions
         if rec_img.ndim != 4 or target_img.ndim != 4:
@@ -243,7 +247,7 @@ class ReconMRIModule(pl.LightningModule):
         # make figures for the first and last image of the epoch
         if batch_idx == 0 or batch_idx == (total_val_batches - 1):
             masked_target = rss(complex_abs(ifft2c(masked_kspace)), dim=1)
-            sens_maps = rss(complex_abs(ifft2c(sens_maps)), dim=1)
+            sens_maps = rss(complex_abs(sens_maps), dim=1)
 
             self.image_figure(
                 rec_img, 

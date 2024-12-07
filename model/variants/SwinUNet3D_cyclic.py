@@ -5,21 +5,20 @@ from einops.layers.torch import Rearrange
 from typing import Union, List
 import numpy as np
 from timm.models.layers import trunc_normal_
-from model.triton.layer_norm import LayerNorm
 
 
-class layer_norm(nn.Module):
-    def __init__(self, normalized_shape, eps=1e-5):
-        super(layer_norm, self).__init__()
-        self.normalized_shape = normalized_shape
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(normalized_shape))
-        self.bias = nn.Parameter(torch.zeros(normalized_shape))
+class CyclicShift3D(nn.Module):
+    def __init__(self, displacement):
+        super().__init__()
+
+        assert type(displacement) is int or len(displacement) == 3, f'displacement must be 1 or 3 dimension'
+        if type(displacement) is int:
+            displacement = np.array([displacement, displacement, displacement])
+        self.displacement = displacement
 
     def forward(self, x):
-        # Call Triton LayerNorm's forward method
-        return LayerNorm.apply(x, self.normalized_shape, self.weight, self.bias, self.eps)
-    
+        return torch.roll(x, shifts=(self.displacement[0], self.displacement[1], self.displacement[2]), dims=(1, 2, 3))
+
 
 class Residual3D(nn.Module):
     def __init__(self, fn):
@@ -34,7 +33,6 @@ class PreNorm3D(nn.Module):
     def __init__(self, dim, fn):
         super().__init__()
         self.norm = nn.LayerNorm(dim)
-        # self.norm = layer_norm(dim)
         self.fn = fn
 
     def forward(self, x, **kwargs):
@@ -58,144 +56,179 @@ class FeedForward3D(nn.Module):
 
 
 def create_mask3D(window_size: Union[int, List[int]], displacement: Union[int, List[int]],
-                  t_shift: bool, x_shift: bool, y_shift: bool):
-    assert type(window_size) is int or len(window_size) == 3, f'window_size must be 1 or 3 dimensions'
+                  x_shift: bool, y_shift: bool, z_shift: bool):
+    assert type(window_size) is int or len(window_size) == 3, f'window_size must be 1 or 3 dimension'
     if type(window_size) is int:
-        window_size = np.array([window_size] * 3)
+        window_size = np.array([window_size, window_size, window_size])
 
-    assert type(displacement) is int or len(displacement) == 3, f'displacement must be 1 or 3 dimensions'
+    assert type(displacement) is int or len(displacement) == 3, f'displacement must be 1 or 3 dimension'
     if type(displacement) is int:
-        displacement = np.array([displacement] * 3)
+        displacement = np.array([displacement, displacement, displacement])
 
     assert len(window_size) == len(displacement)
     for i in range(len(window_size)):
         assert 0 < displacement[i] < window_size[i], \
-            f'Invalid displacement on axis {i}. Dimensions include T(i=0), X(i=1), and Y(i=2)'
+            f'在第{i}轴的偏移量不正确，维度包括X(i=0)，Y(i=1)和Z(i=2)'
 
     mask = torch.zeros(window_size[0] * window_size[1] * window_size[2],
-                       window_size[0] * window_size[1] * window_size[2])  # (wt*wx*wy, wt*wx*wy)
-    mask = rearrange(mask, '(t1 x1 y1) (t2 x2 y2) -> t1 x1 y1 t2 x2 y2',
-                     x1=window_size[1], y1=window_size[2], x2=window_size[1], y2=window_size[2])
+                       window_size[0] * window_size[1] * window_size[2])  # (wx*wy*wz, wx*wy*wz)
+    mask = rearrange(mask, '(x1 y1 z1) (x2 y2 z2) -> x1 y1 z1 x2 y2 z2',
+                     x1=window_size[0], y1=window_size[1], x2=window_size[0], y2=window_size[1])
 
-    t_dist, x_dist, y_dist = displacement
-
-    if t_shift:
-        mask[-t_dist:, :, :, :-t_dist, :, :] = float('-inf')
-        mask[:-t_dist, :, :, -t_dist:, :, :] = float('-inf')
+    x_dist, y_dist, z_dist = displacement[0], displacement[1], displacement[2]
 
     if x_shift:
-        mask[:, -x_dist:, :, :, :-x_dist, :] = float('-inf')
-        mask[:, :-x_dist, :, :, -x_dist:, :] = float('-inf')
+        #      x1     y1 z1     x2     y2 z2
+        mask[-x_dist:, :, :, :-x_dist, :, :] = float('-inf')
+        mask[:-x_dist, :, :, -x_dist:, :, :] = float('-inf')
 
     if y_shift:
-        mask[:, :, -y_dist:, :, :, :-y_dist] = float('-inf')
-        mask[:, :, :-y_dist, :, :, -y_dist:] = float('-inf')
+        #   x1   y1       z1 x2  y2       z2
+        mask[:, -y_dist:, :, :, :-y_dist, :] = float('-inf')
+        mask[:, :-y_dist, :, :, -y_dist:, :] = float('-inf')
 
-    mask = rearrange(mask, 't1 x1 y1 t2 x2 y2 -> (t1 x1 y1) (t2 x2 y2)')
+    if z_shift:
+        #   x1  y1  z1       x2 y2  z2
+        mask[:, :, -z_dist:, :, :, :-z_dist] = float('-inf')
+        mask[:, :, :-z_dist, :, :, -z_dist:] = float('-inf')
+
+    mask = rearrange(mask, 'x1 y1 z1 x2 y2 z2 -> (x1 y1 z1) (x2 y2 z2)')
     return mask
 
 
+# 参考自video_swin_transformer:
+# #https://github.com/MohammadRezaQaderi/Video-Swin-Transformer/blob/c3cd8639decf19a25303615db0b6c1195495f5bb/mmaction/models/backbones/swin_transformer.py#L119
+def get_relative_distances(window_size):
+    assert type(window_size) is int or len(window_size) == 3, f'window_size must be 1 or 3 dimension'
+    if type(window_size) is int:
+        window_size = np.array([window_size, window_size, window_size])
+    indices = torch.tensor(
+        np.array(
+            [[x, y, z] for x in range(window_size[0]) for y in range(window_size[1]) for z in range(window_size[2])]))
+
+    distances = indices[None, :, :] - indices[:, None, :]
+    # distance:(n,n,3) n =window_size[0]*window_size[1]*window_size[2]
+    return distances
+
+
 class WindowAttention3D(nn.Module):
-    def __init__(self, dim, heads, head_dim, shifted, window_size: Union[int, List[int]], relative_pos_embedding=True):
+    def __init__(self, dim: int, heads: int, head_dim: int, shifted: bool, window_size: Union[int, List[int]],
+                 relative_pos_embedding: bool = True):
         super().__init__()
+
+        assert type(window_size) is int or len(window_size) == 3, f'window_size must be 1 or 3 dimension'
+        if type(window_size) is int:
+            window_size = np.array([window_size, window_size, window_size])
+        else:
+            window_size = np.array(window_size)
+
         inner_dim = head_dim * heads
         self.heads = heads
-        self.window_size = np.array(window_size) if isinstance(window_size, list) else np.array([window_size] * 3)
         self.scale = head_dim ** -0.5
-
+        self.window_size = window_size
+        # self.relative_pos_embedding = relative_pos_embedding
         self.shifted = shifted
-        if self.shifted:
-            self.shift_size = self.window_size // 2
-        else:
-            self.shift_size = np.array([0, 0, 0])
 
-        # Masking to handle attention for shifted windows
         if self.shifted:
-            self.t_mask = nn.Parameter(create_mask3D(self.window_size, self.shift_size, t_shift=True, x_shift=False, y_shift=False), requires_grad=False)
-            self.x_mask = nn.Parameter(create_mask3D(self.window_size, self.shift_size, t_shift=False, x_shift=True, y_shift=False), requires_grad=False)
-            self.y_mask = nn.Parameter(create_mask3D(self.window_size, self.shift_size, t_shift=False, x_shift=False, y_shift=True), requires_grad=False)
+            displacement = window_size // 2
+            self.cyclic_shift = CyclicShift3D(-displacement)
+            self.cyclic_back_shift = CyclicShift3D(displacement)
+            self.x_mask = nn.Parameter(create_mask3D(window_size=window_size, displacement=displacement,
+                                                     x_shift=True, y_shift=False, z_shift=False), requires_grad=False)
+            self.y_mask = nn.Parameter(create_mask3D(window_size=window_size, displacement=displacement,
+                                                     x_shift=False, y_shift=True, z_shift=False), requires_grad=False)
+            self.z_mask = nn.Parameter(create_mask3D(window_size=window_size, displacement=displacement,
+                                                     x_shift=False, y_shift=False, z_shift=True), requires_grad=False)
 
-        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)  # QKV三个
+
+        # if self.relative_pos_embedding:
+        #     self.relative_indices = get_relative_distances(window_size)
+        #     # relative_indices的形状为 (n,n,3) n=window_size[0]*window_size[1]*window_size[2],
+        #
+        #     for i in range(len(window_size)):  # 在每个维度上进行偏移
+        #         self.relative_indices[:, :, i] += window_size[i] - 1
+        #
+        #     self.pos_embedding = nn.Parameter(
+        #         torch.randn(2 * window_size[0] - 1, 2 * window_size[1] - 1, 2 * window_size[2] - 1)
+        #     )
+        # else:
+        # self.pos_embedding = nn.Parameter(torch.randn(window_size[0] * window_size[1] * window_size[2],
+        #                                               window_size[0] * window_size[1] * window_size[2]))
+
         self.softmax = nn.Softmax(dim=-1)
         self.to_out = nn.Linear(inner_dim, dim)
 
     def forward(self, x):
         if self.shifted:
-            x = torch.roll(x, shifts=(-self.shift_size[0], -self.shift_size[1], -self.shift_size[2]), dims=(1, 2, 3))
+            x = self.cyclic_shift(x)
 
-        b, n_t, n_x, n_y, _, h = *x.shape, self.heads
+        b, n_x, n_y, n_z, _, h = *x.shape, self.heads
+
         qkv = self.to_qkv(x).chunk(3, dim=-1)
-
-        nw_t = n_t // self.window_size[0]
-        nw_x = n_x // self.window_size[1]
-        nw_y = n_y // self.window_size[2]
+        nw_x = n_x // self.window_size[0]
+        nw_y = n_y // self.window_size[1]
+        nw_z = n_z // self.window_size[2]
 
         q, k, v = map(
-            lambda t: rearrange(t, 'b (nw_t w_t) (nw_x w_x) (nw_y w_y) (h d) -> b h (nw_t nw_x nw_y) (w_t w_x w_y) d',
-                                h=h, w_t=self.window_size[0], w_x=self.window_size[1], w_y=self.window_size[2]), qkv)
+            lambda t: rearrange(t, 'b (nw_x w_x) (nw_y w_y) (nw_z w_z) (h d) -> b h (nw_x nw_y nw_z) (w_x w_y w_z) d',
+                                h=h, w_x=self.window_size[0], w_y=self.window_size[1], w_z=self.window_size[2]), qkv)
 
-        # similarity scores between the vectors from q and k for each combination of the indices i and j
-        dots = einsum('b h w i d, b h w j d -> b h w i j', q, k) * self.scale
+        dots = einsum('b h w i d, b h w j d -> b h w i j', q, k) * self.scale  # q和k的矩阵乘法
 
-        # Apply window-specific masking for shifted windows
+        # if self.relative_pos_embedding:
+        #     dots += self.pos_embedding[self.relative_indices[:, :, 0].long(), self.relative_indices[:, :, 1].long(),
+        #                                self.relative_indices[:, :, 2].long()]
+        # else:
+        #   dots += self.pos_embedding  # 触发了广播机制
+
         if self.shifted:
-            dots = rearrange(dots, 'b h (n_t n_x n_y) i j -> b h n_x n_y n_t i j', n_x=nw_x, n_y=nw_y)
-            dots[:, :, :, :, -1] += self.t_mask
-            dots = rearrange(dots, 'b h n_x n_y n_t i j -> b h n_t n_y n_x i j')
+            # 将x轴的窗口数量移至尾部，便于和x轴上对应的mask叠加，下同
+            dots = rearrange(dots, 'b h (n_x n_y n_z) i j -> b h n_y n_z n_x i j',
+                             n_x=nw_x, n_y=nw_y)
+            #   b   h n_y n_z n_x i j
             dots[:, :, :, :, -1] += self.x_mask
-            dots = rearrange(dots, 'b h n_t n_y n_x i j -> b h n_t n_x n_y i j')
+
+            dots = rearrange(dots, 'b h n_y n_z n_x i j -> b h n_x n_z n_y i j')
             dots[:, :, :, :, -1] += self.y_mask
-            dots = rearrange(dots, 'b h n_t n_x n_y i j -> b h (n_t n_x n_y) i j')
 
+            dots = rearrange(dots, 'b h n_x n_z n_y i j -> b h n_x n_y n_z i j')
+            dots[:, :, :, :, -1] += self.z_mask
+
+            dots = rearrange(dots, 'b h n_y n_z n_x i j -> b h (n_x n_y n_z) i j')
+
+        # attn = dots.softmax(dim=-1)
         attn = self.softmax(dots)
-        
-        # performs a weighted sum of the values
-        out = einsum('b h w i j, b h w j d -> b h w i d', attn, v)
+        out = einsum('b h w i j, b h w j d -> b h w i d', attn, v)  # 进行attn和v的矩阵乘法
 
-        out = rearrange(out, 'b h (nw_t nw_x nw_y) (w_t w_x w_y) d -> b (nw_t w_t) (nw_x w_x) (nw_y w_y) (h d)',
-                        h=h, w_t=self.window_size[0], w_x=self.window_size[1], w_y=self.window_size[2],
-                        nw_t=nw_t, nw_x=nw_x, nw_y=nw_y)
-
+        # nw_x 表示x轴上窗口的数量 , nw_y 表示 y轴上窗口的数量，nw_Z表示z轴上窗口的数量
+        # w_x 表示 x_window_size, w_y 表示 y_window_size， w_z表示z_window_size
+        #                     b 3  (8,8,8)         （7,  7,  7） 96 -> b  56          56          56        288
+        out = rearrange(out, 'b h (nw_x nw_y nw_z) (w_x w_y w_z) d -> b (nw_x w_x) (nw_y w_y) (nw_z w_z) (h d)',
+                        h=h, w_x=self.window_size[0], w_y=self.window_size[1], w_z=self.window_size[2],
+                        nw_x=nw_x, nw_y=nw_y, nw_z=nw_z)
         out = self.to_out(out)
 
         if self.shifted:
-            out = torch.roll(out, shifts=(self.shift_size[0], self.shift_size[1], self.shift_size[2]), dims=(1, 2, 3))
-
+            out = self.cyclic_back_shift(out)
         return out
 
 
-
-class SwinBlock3D(nn.Module):
-    def __init__(self, dim, heads, head_dim, mlp_dim, shifted, window_size, relative_pos_embedding=True, dropout=0.0):
+class SwinBlock3D(nn.Module):  # 不会改变输入空间分辨率
+    def __init__(self, dim, heads, head_dim, mlp_dim, shifted, window_size: Union[int, List[int]],
+                 relative_pos_embedding: bool = True, dropout: float = 0.0):
         super().__init__()
-
-        self.shifted = shifted  # Whether to use the shifted window mechanism
-        self.window_size = window_size  # Window size
-
-        # Residual attention block with or without shift
-        self.attention_block = Residual3D(
-            PreNorm3D(dim, WindowAttention3D(
-                dim=dim,
-                heads=heads,
-                head_dim=head_dim,
-                shifted=shifted,
-                window_size=window_size,
-                relative_pos_embedding=relative_pos_embedding
-            ))
-        )
-
-        # MLP block after attention with residual
-        self.mlp_block = Residual3D(
-            PreNorm3D(dim, FeedForward3D(dim=dim, hidden_dim=mlp_dim, dropout=dropout))
-        )
+        self.attention_block = Residual3D(PreNorm3D(dim, WindowAttention3D(dim=dim,
+                                                                           heads=heads,
+                                                                           head_dim=head_dim,
+                                                                           shifted=shifted,
+                                                                           window_size=window_size,
+                                                                           relative_pos_embedding=relative_pos_embedding)))
+        self.mlp_block = Residual3D(PreNorm3D(dim, FeedForward3D(dim=dim, hidden_dim=mlp_dim, dropout=dropout)))
 
     def forward(self, x):
-        # Apply attention block (with or without shift depending on the value of `shifted`)
         x = self.attention_block(x)
-
-        # Apply the feed-forward MLP block
         x = self.mlp_block(x)
-
         return x
 
 
@@ -204,16 +237,14 @@ class Norm(nn.Module):
         super(Norm, self).__init__()
         if channel_first:
             self.net = nn.Sequential(
-                Rearrange('b c t x y -> b t x y c'),
+                Rearrange('b c h w d -> b h w d c'),
                 nn.LayerNorm(dim),
-                #layer_norm(dim),
-                Rearrange('b t x y c -> b c t x y')
+                Rearrange('b h w d c -> b c h w d')
             )
 
             # self.net = nn.InstanceNorm3d(dim, eps=1e-5, momentum=0.1, affine=False)
         else:
             self.net = nn.LayerNorm(dim)
-            #self.net = layer_norm(dim)
 
     def forward(self, x):
         x = self.net(x)
@@ -225,60 +256,58 @@ class PatchMerging3D(nn.Module):
         super().__init__()
         dsf = downscaling_factor
         self.net = nn.Sequential(
-            Rearrange('b c (n_t dsf_t) (n_x dsf_x) (n_y dsf_y) -> b n_t n_x n_y (dsf_t dsf_x dsf_y c)',
-                dsf_t=dsf, dsf_x=dsf, dsf_y=dsf),
+            Rearrange('b c (n_h dsf_h) (n_w dsf_w) (n_d dsf_d) -> b n_h n_w n_d (dsf_h dsf_w dsf_d c)',
+                      dsf_h=dsf, dsf_w=dsf, dsf_d=dsf),
             nn.Linear(in_dim * (dsf ** 3), out_dim),
             Norm(out_dim, channel_first=False),
-            Rearrange('b t x y c -> b c t x y')
+            Rearrange('b h w d c -> b c h w d')
         )
 
     def forward(self, x):
-        # x: B, C, T, X, Y
+        # x: B, C, H, W, D
         x = self.net(x)
-        return x  # B, T //down_scaling, X // down_scaling, Y // down_scaling, out_dim
+        return x  # B,  H //down_scaling, W//down_scaling, D//down_scaling, out_dim
 
 
-
-class PatchExpanding3D(nn.Module):
+class PatchExpand3D(nn.Module):
     def __init__(self, in_dim, out_dim, up_scaling_factor):
-        super(PatchExpanding3D, self).__init__()
+        super(PatchExpand3D, self).__init__()
 
         self.usf = up_scaling_factor
         hidden_dim = (up_scaling_factor ** 3) * out_dim
         self.net = nn.Sequential(
-            Rearrange('b c t x y -> b t x y c'),
+            Rearrange('b c h w d -> b h w d c'),
             nn.Linear(in_dim, hidden_dim),
-            Rearrange('b t_s x_s y_s (fac1 fac2 fac3 c) -> b c (t_s fac1) (x_s fac2) (y_s fac3)',
+            Rearrange('b h_s w_s d_s (fac1 fac2 fac3 c) -> b c (h_s fac1) (w_s fac2) (d_s fac3)',
                       fac1=self.usf, fac2=self.usf, fac3=self.usf),
             Norm(out_dim),
         )
 
     def forward(self, x):
-        '''X: B,C,T,X,Y'''
+        '''X: B,C,X,Y,Z'''
         x = self.net(x)
         return x
 
 
-class FinalExpand3D(nn.Module):  # Final voxel classification
-    def __init__(self, in_dim, out_dim, up_scaling_factor):
+class FinalExpand3D(nn.Module):  # 体素最终分类时使用
+    def __init__(self, in_dim, out_dim, up_scaling_factor):  # stl为second_to_last的缩写
         super(FinalExpand3D, self).__init__()
-        # T, X, Y, out_dims -> T, X, Y, (up_scaling ** 3) * out_dims
-        self.usf = up_scaling_factor
+        # H, W, D, out_dims -> H, W, D, (down_scaling ** 3) * out_dims
+        self.usf = up_scaling_factor  # 2 或者 4
         hidden_dim = (up_scaling_factor ** 3) * out_dim
         self.net = nn.Sequential(
-            Rearrange('b c t x y -> b t x y c'),
+            Rearrange('b c h w d -> b h w d c'),
             nn.Linear(in_dim, hidden_dim),
-            Rearrange('b t_s x_s y_s (fac1 fac2 fac3 c) -> b c (t_s fac1) (x_s fac2) (y_s fac3)',
+            Rearrange('b h_s w_s d_s (fac1 fac2 fac3 c) -> b c (h_s fac1) (w_s fac2) (d_s fac3)',
                       fac1=self.usf, fac2=self.usf, fac3=self.usf),
             Norm(out_dim),
             nn.PReLU()
         )
 
     def forward(self, x):
-        '''X: B,C,T,X,Y'''
+        '''X: B,C,H,W,D'''
         x = self.net(x)
         return x
-
 
 
 class Encoder(nn.Module):
@@ -290,7 +319,7 @@ class Encoder(nn.Module):
         self.patch_partition = PatchMerging3D(in_dim=in_dims, out_dim=hidden_dimension,
                                               downscaling_factor=downscaling_factor)
 
-        self.re1 = Rearrange('b c t x y -> b t x y c')
+        self.re1 = Rearrange('b c h w d -> b h w d c')
         self.swin_layers = nn.ModuleList([])
         for _ in range(layers // 2):
             self.swin_layers.append(nn.ModuleList([
@@ -301,7 +330,7 @@ class Encoder(nn.Module):
                             shifted=True, window_size=window_size, relative_pos_embedding=relative_pos_embedding,
                             dropout=dropout),
             ]))
-        self.re2 = Rearrange('b t x y c -> b c t x y')
+        self.re2 = Rearrange('b  h w d c -> b c h w d')
 
     def forward(self, x):
         x = self.patch_partition(x)
@@ -321,10 +350,10 @@ class Decoder(nn.Module):
         super().__init__()
         assert layers % 2 == 0, 'Stage layers need to be divisible by 2 for regular and shifted block.'
 
-        self.patch_expand = PatchExpanding3D(in_dim=in_dims, out_dim=out_dims,
-                                             up_scaling_factor=up_scaling_factor)
+        self.patch_expand = PatchExpand3D(in_dim=in_dims, out_dim=out_dims,
+                                          up_scaling_factor=up_scaling_factor)
 
-        self.re1 = Rearrange('b c t x y -> b t x y c')
+        self.re1 = Rearrange('b c h w d -> b h w d c')
         self.swin_layers = nn.ModuleList([])
         for _ in range(layers // 2):
             self.swin_layers.append(nn.ModuleList([
@@ -335,7 +364,7 @@ class Decoder(nn.Module):
                             shifted=True, window_size=window_size, relative_pos_embedding=relative_pos_embedding,
                             dropout=dropout),
             ]))
-        self.re2 = Rearrange('b t x y c -> b c t x y')
+        self.re2 = Rearrange('b h w d c -> b c h w d')
 
     def forward(self, x):
         x = self.patch_expand(x)
@@ -360,8 +389,8 @@ class Converge(nn.Module):
 
     def forward(self, x, enc_x):
         '''
-         x: B,C,T,X,Y
-        enc_x:B,C,T,X,Y
+         x: B,C,X,Y,Z
+        enc_x:B,C,X,Y,Z
         '''
         assert x.shape == enc_x.shape
         x = x + enc_x
@@ -425,7 +454,7 @@ class SwinUnet3D(nn.Module):
                                    up_scaling_factor=downscaling_factors[0])
         self.out = nn.Sequential(
             # nn.Linear(stl_channels, num_classes),
-            # Rearrange('b t x y c -> b c t x y'),
+            # Rearrange('b h w d c -> b c h w d'),
             nn.Conv3d(stl_channels, num_classes, kernel_size=1)
         )
         # 参数初始化
@@ -433,34 +462,35 @@ class SwinUnet3D(nn.Module):
 
     def forward(self, img):
         window_size = self.window_size
-        assert type(window_size) is int or len(window_size) == 3, f'window_size must be 1 or 3 dimensions'
+        assert type(window_size) is int or len(window_size) == 3, f'window_size must be 1 or 3 dimension'
         if type(window_size) is int:
             window_size = np.array([window_size, window_size, window_size])
-        _, _, t_s, x_s, y_s  = img.shape
-        t_ws, x_ws, y_ws = window_size
+        _, _, x_s, y_s, z_s = img.shape
+        x_ws, y_ws, z_ws = window_size
 
-        assert t_s % (t_ws * 16) == 0, f'The size along the t-axis must be divisible by t_window_size * 16'
         assert x_s % (x_ws * 16) == 0, f'The size along the x-axis must be divisible by x_window_size * 16'
         assert y_s % (y_ws * 16) == 0, f'The size along the y-axis must be divisible by y_window_size * 16'
+        assert z_s % (z_ws * 16) == 0, f'The size along the z-axis must be divisible by t_window_size * 16'
+        
 
-        down12_1 = self.enc12(img)              # (B, C, T//2, X//2, Y//2)
-        down3 = self.enc3(down12_1)             # (B, 2C, T//4, X//4, Y//4)
-        down4 = self.enc4(down3)                # (B, 4C, T//8, X//8, Y//8)
-        features = self.enc5(down4)             # (B, 8C, T//16, X//16, Y//16)
+        down12_1 = self.enc12(img)              # (B, C, X//2, Y//2, Z//2)
+        down3 = self.enc3(down12_1)             # (B, 2C, X//4, Y//4, Z//4)
+        down4 = self.enc4(down3)                # (B, 4C, X//8, Y//8, Z//8)
+        features = self.enc5(down4)             # (B, 8C, X//16, Y//16, Z//16)
 
-        up4 = self.dec4(features)               # (B, 8C, T//8, X//8, Y//8)
+        up4 = self.dec4(features)               # (B, 8C, X//8, Y//8, Z//8)
         # Merge up4 and down4
-        up4 = self.converge4(up4, down4)        # (B, 4C, T//8, X//8, Y//8)
+        up4 = self.converge4(up4, down4)        # (B, 4C, X//8, Y//8, Z//8)
 
-        up3 = self.dec3(up4)                    # (B, 4C, T//4, X//4, Y//4)
+        up3 = self.dec3(up4)                    # (B, 4C, X//4, Y//4, Z//4)
         # Merge up3 and down3
-        up3 = self.converge3(up3, down3)        # (B, 2C, T//4, X//4, Y//4)
+        up3 = self.converge3(up3, down3)        # (B, 2C, X//4, Y//4, Z//4)
 
-        up12 = self.dec12(up3)                  # (B, 2C, T//2, X//2, Y//2)
+        up12 = self.dec12(up3)                  # (B, 2C, X//2, Y//2, Z//2)
         # Merge up12 and down12_1
-        up12 = self.converge12(up12, down12_1)  # (B, C, T//2, X//2, Y//2)
+        up12 = self.converge12(up12, down12_1)  # (B, C, X//2, Y//2, Z//2)
 
-        out = self.final(up12)                  # (B, num_classes, T, X, Y)
+        out = self.final(up12)                  # (B, num_classes, X, Y, Z)
         out = self.out(out)
         return out
 

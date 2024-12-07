@@ -15,7 +15,7 @@ import torch.nn.functional as F
 import math
 from typing import List, Tuple, Optional
 from model import utils
-import torch.utils.checkpoint as cp
+from data_utils.transforms import batched_mask_center
 from fastmri import ifft2c, rss, complex_abs
 
 #########################################################################################################
@@ -23,15 +23,6 @@ from fastmri import ifft2c, rss, complex_abs
 #########################################################################################################
 
 class SMEB3D(nn.Module):
-    """
-    Model for learning sensitivity estimation from k-space data.
-
-    This model applies an IFFT to multichannel k-space data and then a 3D U-Net
-    to the coil images to estimate coil sensitivities. 
-
-    Note SMEB3D is designed for complex input/output only.
-    """
-
     def __init__(
         self,
         in_chans: int = 2,
@@ -39,7 +30,7 @@ class SMEB3D(nn.Module):
         chans: int = 32,
         num_pools: int = 4,
         drop_prob: float = 0.0,
-        mask_center: bool = True        
+        mask_center: bool = True
     ):
         """
         Args:
@@ -53,6 +44,7 @@ class SMEB3D(nn.Module):
         super().__init__()
         self.mask_center = mask_center
 
+        # Replace NormUnet with a 3D U-Net
         self.norm_net = NormNet3D(
             in_chans=in_chans,
             out_chans=out_chans,
@@ -61,64 +53,92 @@ class SMEB3D(nn.Module):
             drop_prob=drop_prob,
         )
 
+    def chans_to_batch_dim(self, x: torch.Tensor) -> Tuple[torch.Tensor, int]:
+        b, c, t, h, w, comp = x.shape
+        # Batch over the channel dimension
+        return x.view(b * c, 1, t, h, w, comp), b
+
+    def batch_chans_to_chan_dim(self, x: torch.Tensor, batch_size: int) -> torch.Tensor:
+        bc, _, t, h, w, comp = x.shape
+        c = bc // batch_size
+        # Restore the channel dimension
+        return x.view(batch_size, c, t, h, w, comp)
+
+    def get_pad_and_num_low_freqs(
+        self, mask: torch.Tensor, num_low_frequencies: Optional[list] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch_size = mask.shape[0]
+        pad = torch.zeros((batch_size, 2), dtype=torch.long, device=mask.device)
+
+        if num_low_frequencies is None or num_low_frequencies == 0:
+            squeezed_mask = mask[:, 0, 0, :, 0].to(torch.int8)
+            cent = squeezed_mask.shape[1] // 2
+            left = torch.argmin(squeezed_mask[:, :cent].flip(1), dim=1)
+            right = torch.argmin(squeezed_mask[:, cent:], dim=1)
+            num_low_frequencies_tensor = torch.max(
+                2 * torch.min(left, right), torch.ones_like(left)
+            ).view(batch_size, 1)
+            pad[:, 1] = ((mask.shape[-2] - num_low_frequencies_tensor + 1) // 2).squeeze(1)
+
+        else:
+            num_low_frequencies_tensor = torch.ones(
+                (batch_size, 2), dtype=torch.long, device=mask.device
+            )
+            if len(num_low_frequencies) == 1:
+                num_low_frequencies_tensor[:, 0] = num_low_frequencies[0]
+                pad[:, 0] = ((mask.shape[-3] - num_low_frequencies_tensor[:, 0] + 1) // 2).long()
+                num_low_frequencies_tensor[:, 1] = mask.shape[-2]
+                pad[:, 1] = 0
+            elif len(num_low_frequencies) == 2:
+                num_low_frequencies_tensor[:, 0] = num_low_frequencies[0]
+                num_low_frequencies_tensor[:, 1] = num_low_frequencies[1]
+                pad[:, 0] = ((mask.shape[-3] - num_low_frequencies_tensor[:, 0] + 1) // 2).long()
+                pad[:, 1] = ((mask.shape[-2] - num_low_frequencies_tensor[:, 1] + 1) // 2).long()
+
+        return pad, num_low_frequencies_tensor
+
     def forward(
         self,
         masked_kspace: torch.Tensor,
+        mask: torch.Tensor,
         num_low_frequencies: list,
         max_img_size: list
     ) -> torch.Tensor:
+        b, c, t, h, w, comp = masked_kspace.shape
+
+        # Mask the center frequencies
+        if self.mask_center:
+            pad, num_low_freqs = self.get_pad_and_num_low_freqs(mask[:, :, 0, :, :, :], num_low_frequencies)
+            masked_kspace = masked_kspace.clone()
+            modified_kspace = batched_mask_center(
+                masked_kspace, pad, pad + num_low_freqs
+            )
+            masked_kspace = modified_kspace
+
+        # Pad without modifying the original tensor
+        masked_kspace, _ = utils.pad_to_max_size(masked_kspace, max_img_size)
+        b, c, t, h, w, comp = masked_kspace.shape
         
-        # Calculate the ACS mask before padding
-        ACS_mask = torch.zeros_like(masked_kspace)
+        # Convert k-space to image domain
+        images = ifft2c(masked_kspace)
 
-        if len(num_low_frequencies) == 1:
-            num_low_freq_w = num_low_frequencies[0]
-            center_w = masked_kspace.shape[-2] // 2
-            half_num_low_freq_w = num_low_freq_w // 2
-            ACS_mask[
-                ..., :,
-                center_w - half_num_low_freq_w: center_w + half_num_low_freq_w
-            ] = 1
-        
-        elif len(num_low_frequencies) == 2:
-            num_low_freq_h, num_low_freq_w = num_low_frequencies
-            center_h, center_w = masked_kspace.shape[-3] // 2, masked_kspace.shape[-2] // 2
-            half_low_freq_h, half_low_freq_w = num_low_freq_h // 2, num_low_freq_w // 2
-            ACS_mask[
-                ..., center_h - half_low_freq_h: center_h + half_low_freq_h,
-                center_w - half_low_freq_w: center_w + half_low_freq_w
-            ] = 1
+        # Reshape to batch over the channel dimension
+        batched_images, batch_size = self.chans_to_batch_dim(images)
 
-        masked_kspace_padded, original_size = utils.pad_to_max_size(masked_kspace, max_img_size)
-        ACS_mask_padded, _ = utils.pad_to_max_size(ACS_mask, max_img_size)
+        # Pass through the 3D U-Net
+        unet_output, gates = self.norm_net(batched_images)
 
-        # Apply the padded ACS mask to the padded k-space data
-        ACS_kspace_padded = ACS_mask_padded * masked_kspace_padded
+        # Restore the channel dimension
+        unet_output = self.batch_chans_to_chan_dim(unet_output, batch_size)
+        gates = gates.view(b, c, t, h, w, 1)
 
-        # Convert to image space
-        ACS_images_padded = ifft2c(ACS_kspace_padded)
-        
-        # Estimate sensitivities independently
-        b, c, t, h, w, comp = ACS_images_padded.shape
-        batched_c = ACS_images_padded.reshape(b * c, 1, t, h, w, comp)
+        # Normalize sensitivities and apply gating
+        rss_norm = rss(complex_abs(unet_output), dim=1).unsqueeze(1).unsqueeze(-1)
+        sens = unet_output / (rss_norm + 1e-12)
+        sens = sens * gates
 
-        sens, gate = self.norm_net(batched_c)
+        return sens, gates
 
-        # Reshape back to original dimensions
-        # gate is not complex as we do not want to modulate the real and imaginary parts differently
-        gate = gate.reshape(b, c, t, h, w).unsqueeze(-1)
-        sens = sens.reshape(b, c, t, h, w, comp)
-
-        # Normalize and apply gating
-        sens = sens / (rss(complex_abs(sens), dim=1).unsqueeze(1).unsqueeze(-1) + 1e-12)
-        sens = gate * sens
-
-        # NOTE: we will unpad in our model later
-        # Unpad the outputs to the original size
-        # sens = utils.unpad_from_max_size(sens, original_size)
-        # gate = utils.unpad_from_max_size(gate, original_size)
-
-        return sens, gate
     
 
 #########################################################################################################
@@ -179,9 +199,7 @@ class NormNet3D(nn.Module):
         return x * std + mean
     
 
-    def pad(
-        self, x: torch.Tensor
-    ) -> Tuple[torch.Tensor, Tuple[List[int], List[int], List[int], int, int, int]]:
+    def pad(self, x: torch.Tensor) -> Tuple[torch.Tensor, Tuple[List[int], List[int], List[int], int, int, int]]:
         _, _, t, h, w = x.shape
 
         # Calculate the multiples to align to the nearest multiple of 16
@@ -194,10 +212,11 @@ class NormNet3D(nn.Module):
         h_pad = [math.floor((h_mult - h) / 2), math.ceil((h_mult - h) / 2)]
         w_pad = [math.floor((w_mult - w) / 2), math.ceil((w_mult - w) / 2)]
 
-        # Apply padding
-        x = F.pad(x, w_pad + h_pad + t_pad)
+        # Apply padding symmetrically
+        x = F.pad(x, w_pad + h_pad + t_pad, mode="constant", value=0)
 
         return x, (t_pad, h_pad, w_pad, t_mult, h_mult, w_mult)
+
 
 
     def unpad(
@@ -356,7 +375,7 @@ class UNet3D(nn.Module):
         output = output_.view(output.shape)
 
         # TODO: This is a little ugly, need to adjust the hardcoding
-        output = F.interpolate(output, scale_factor=2**(self.num_pools-3), mode='trilinear', align_corners=True)
+        output = F.interpolate(output, scale_factor=2**(self.num_pools-3), mode='trilinear', align_corners=False)
 
         #### normal ####
         norm_conv = self.norm_conv(output)
@@ -527,58 +546,58 @@ class SpatialAttention(nn.Module):
         out = self.sigmoid(self.conv2d(out))
         return out
 
-class SpatiotemporalAttention(nn.Module):
-    def __init__(self, in_channels):
-        super(SpatiotemporalAttention, self).__init__()
-
-        # Spatial attention (2D convolution)
-        self.spatial_conv = nn.Conv2d(in_channels, out_channels=1, kernel_size=7, stride=1, padding=3)
-
-        # Temporal attention (1D convolution)
-        self.temporal_conv = nn.Conv1d(in_channels=1, out_channels=1, kernel_size=3, stride=1, padding=1)
-
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, image):
-        # image: B, C, T, X, Y
-        B, C, T, X, Y = image.shape
-
-        #### Spatial Attention ####
-        avgout = torch.mean(image, dim=1, keepdim=True)  # Shape: (B, 1, T, X, Y)
-        maxout, _ = torch.max(image, dim=1, keepdim=True)  # Shape: (B, 1, T, X, Y)
-        out = torch.cat([avgout, maxout], dim=1)  # Shape: (B, 2, T, X, Y)
-
-        # Reshape for 2D convolution: (B * T, 2, X, Y)
-        out = out.permute(0, 2, 1, 3, 4).reshape(B * T, 2, X, Y)
-        out = self.spatial_conv(out)  # Apply 2D convolution on (X, Y)
-        out = self.sigmoid(out)  # Spatial attention weights: (B * T, 1, X, Y)
-
-        # Reshape back to (B, T, 1, X, Y)
-        out = out.reshape(B, T, 1, X, Y)
-
-        #### Temporal Attention ####
-        # Reshape for 1D convolution: (B * X * Y, 1, T)
-        out = out.permute(0, 3, 4, 2, 1).reshape(B * X * Y, 1, T)
-        out = self.temporal_conv(out)  # Apply 1D convolution on temporal dimension (T)
-        out = self.sigmoid(out)  # Temporal attention weights: (B * X * Y, 1, T)
-
-        # Reshape back to (B, X, Y, 1, T), then permute to (B, 1, T, X, Y)
-        out = out.reshape(B, X, Y, 1, T).permute(0, 3, 4, 1, 2).contiguous()
-
-        return out  # Attention weights for both spatial and temporal dimensions
-
-
-
-
 # class SpatiotemporalAttention(nn.Module):
 #     def __init__(self, in_channels):
 #         super(SpatiotemporalAttention, self).__init__()
-#         self.conv3d = nn.Conv3d(in_channels=in_channels, out_channels=1, kernel_size=3, stride=1, padding=1)
+
+#         # Spatial attention (2D convolution)
+#         self.spatial_conv = nn.Conv2d(in_channels, out_channels=1, kernel_size=7, stride=1, padding=3)
+
+#         # Temporal attention (1D convolution)
+#         self.temporal_conv = nn.Conv1d(in_channels=1, out_channels=1, kernel_size=3, stride=1, padding=1)
+
 #         self.sigmoid = nn.Sigmoid()
 
 #     def forward(self, image):
-#         avgout = torch.mean(image, dim=1, keepdim=True)
-#         maxout, _ = torch.max(image, dim=1, keepdim=True)
-#         out = torch.cat([avgout, maxout], dim=1)
-#         out = self.sigmoid(self.conv3d(out))
-#         return out
+#         # image: B, C, T, X, Y
+#         B, C, T, X, Y = image.shape
+
+#         #### Spatial Attention ####
+#         avgout = torch.mean(image, dim=1, keepdim=True)  # Shape: (B, 1, T, X, Y)
+#         maxout, _ = torch.max(image, dim=1, keepdim=True)  # Shape: (B, 1, T, X, Y)
+#         out = torch.cat([avgout, maxout], dim=1)  # Shape: (B, 2, T, X, Y)
+
+#         # Reshape for 2D convolution: (B * T, 2, X, Y)
+#         out = out.permute(0, 2, 1, 3, 4).reshape(B * T, 2, X, Y)
+#         out = self.spatial_conv(out)  # Apply 2D convolution on (X, Y)
+#         out = self.sigmoid(out)  # Spatial attention weights: (B * T, 1, X, Y)
+
+#         # Reshape back to (B, T, 1, X, Y)
+#         out = out.reshape(B, T, 1, X, Y)
+
+#         #### Temporal Attention ####
+#         # Reshape for 1D convolution: (B * X * Y, 1, T)
+#         out = out.permute(0, 3, 4, 2, 1).reshape(B * X * Y, 1, T)
+#         out = self.temporal_conv(out)  # Apply 1D convolution on temporal dimension (T)
+#         out = self.sigmoid(out)  # Temporal attention weights: (B * X * Y, 1, T)
+
+#         # Reshape back to (B, X, Y, 1, T), then permute to (B, 1, T, X, Y)
+#         out = out.reshape(B, X, Y, 1, T).permute(0, 3, 4, 1, 2).contiguous()
+
+#         return out  # Attention weights for both spatial and temporal dimensions
+
+
+
+
+class SpatiotemporalAttention(nn.Module):
+    def __init__(self, in_channels):
+        super(SpatiotemporalAttention, self).__init__()
+        self.conv3d = nn.Conv3d(in_channels=in_channels, out_channels=1, kernel_size=3, stride=1, padding=1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, image):
+        avgout = torch.mean(image, dim=1, keepdim=True)
+        maxout, _ = torch.max(image, dim=1, keepdim=True)
+        out = torch.cat([avgout, maxout], dim=1)
+        out = self.sigmoid(self.conv3d(out))
+        return out

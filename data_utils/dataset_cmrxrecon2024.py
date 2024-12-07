@@ -256,26 +256,29 @@ class VolumeDataset(torch.utils.data.Dataset):
                                 mask_dir = attrs['masks']
                                 modality_view = Path(full_ks_file_path).stem.replace('.h5', '')
                                 
-                                # Divide image into individual slices
-                                for slice_ind in range(num_slices):
-                                    
-                                    # Filter the available masks for the current modality_view
-                                    matching_masks = [mask_file for mask_file in os.listdir(mask_dir) if modality_view in mask_file]
-                                    
-                                    if matching_masks:
-                                        # Randomly choose one mask from the matching masks
-                                        chosen_mask = random.choice(matching_masks)
-                                        mask_path = os.path.join(mask_dir, chosen_mask)
+                                # Divide the 3D image into individual 2D slices along the time axis
+                                for time_index in range(kdata.shape[1]):  # Iterate over the time dimension
+                                    for slice_index in range(kdata.shape[4]):  # Iterate over the slice dimension
+                                        # Filter the available masks for the current modality_view
+                                        matching_masks = [
+                                            mask_file for mask_file in os.listdir(mask_dir) if modality_view in mask_file
+                                        ]
+                                        
+                                        if matching_masks:
+                                            # Randomly choose one mask from the matching masks
+                                            chosen_mask = random.choice(matching_masks)
+                                            mask_path = os.path.join(mask_dir, chosen_mask)
 
-                                        # Add the sample with the selected mask
-                                        self.raw_samples.append(
-                                            CMRxReconRawDataSample(
-                                                full_ks_file_path, 
-                                                slice_ind, 
-                                                attrs, 
-                                                mask_path
+                                            # Add the sample with both time and slice indices
+                                            self.raw_samples.append(
+                                                CMRxReconRawDataSample(
+                                                    full_ks_file_path,  # Path to the HDF5 file
+                                                    (time_index, slice_index),  # Tuple of time and slice indices
+                                                    attrs,                      # Attributes remain the same
+                                                    mask_path                   # Path to the mask
+                                                )
                                             )
-                                        )
+
 
                                 # NOTE: This is the code to use all the available masks for each slice
 

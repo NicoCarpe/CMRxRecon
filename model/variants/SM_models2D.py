@@ -13,7 +13,7 @@ import math
 from typing import List, Tuple, Optional
 from model import utils
 from data_utils.transforms import batched_mask_center
-from fastmri import ifft2c, rss, complex_abs
+from fastmri import ifft2c, rss, complex_abs, rss_complex
 
 class SMEB(nn.Module):
     """
@@ -46,7 +46,7 @@ class SMEB(nn.Module):
         super().__init__()
         self.mask_center = mask_center
 
-        self.norm_net = NormUnet(
+        self.norm_unet = NormUnet(
             in_chans=in_chans,
             out_chans=out_chans,
             chans=chans,
@@ -54,10 +54,9 @@ class SMEB(nn.Module):
             drop_prob=drop_prob,
         )
 
-
     def chans_to_batch_dim(self, x: torch.Tensor) -> Tuple[torch.Tensor, int]:
         b, c, h, w, comp = x.shape
-
+        
         return x.view(b * c, 1, h, w, comp), b
 
 
@@ -66,10 +65,10 @@ class SMEB(nn.Module):
         c = bc // batch_size
 
         return x.view(batch_size, c, h, w, comp)
-
-
+    
+    
     def divide_root_sum_of_squares(self, x: torch.Tensor) -> torch.Tensor:
-        return x / fastmri.rss_complex(x, dim=1).unsqueeze(-1).unsqueeze(1)
+        return x / rss_complex(x, dim=1).unsqueeze(-1).unsqueeze(1)
 
 
     def get_pad_and_num_low_freqs(
@@ -80,7 +79,6 @@ class SMEB(nn.Module):
         pad = torch.zeros((batch_size, 2), dtype=torch.long, device=mask.device)  # Ensure pad has shape [batch_size, 2]
 
         if num_low_frequencies is None or num_low_frequencies == 0:
-            # Symmetric low frequency selection for `w` dimension
             squeezed_mask = mask[:, 0, 0, :, 0].to(torch.int8)
             cent = squeezed_mask.shape[1] // 2
             left = torch.argmin(squeezed_mask[:, :cent].flip(1), dim=1)
@@ -89,18 +87,21 @@ class SMEB(nn.Module):
                 2 * torch.min(left, right), torch.ones_like(left)
             ).view(batch_size, 1)  # Shape it as [batch_size, 1] for compatibility
             
-            # Only padding in `w` dimension
             pad[:, 1] = ((mask.shape[-2] - num_low_frequencies_tensor + 1) // 2).squeeze(1)
 
         else:
-            # Initialize with ones and expand for `[batch_size, 2]` shape
             num_low_frequencies_tensor = torch.ones(
                 (batch_size, 2), dtype=torch.long, device=mask.device
             )
 
             if len(num_low_frequencies) == 1:
-                num_low_frequencies_tensor[:, 1] = num_low_frequencies[0]
-                pad[:, 1] = ((mask.shape[-2] - num_low_frequencies_tensor[:, 1] + 1) // 2).long()
+                # Only height is specified
+                num_low_frequencies_tensor[:, 0] = num_low_frequencies[0]  # Height dimension
+                pad[:, 0] = ((mask.shape[-3] - num_low_frequencies_tensor[:, 0] + 1) // 2).long()
+
+                # For width, we don't change anything, so full width is used
+                num_low_frequencies_tensor[:, 1] = mask.shape[-2]  # Full width
+                pad[:, 1] = 0  # No padding for width
 
             elif len(num_low_frequencies) == 2:
                 num_low_frequencies_tensor[:, 0] = num_low_frequencies[0]  # h dimension
@@ -109,7 +110,7 @@ class SMEB(nn.Module):
                 pad[:, 1] = ((mask.shape[-2] - num_low_frequencies_tensor[:, 1] + 1) // 2).long()
 
         return pad, num_low_frequencies_tensor
-
+    
 
     def forward(
         self,
@@ -118,112 +119,53 @@ class SMEB(nn.Module):
         num_low_frequencies: list,
         max_img_size: list
     ) -> torch.Tensor:
-
+        """
+        Forward pass with parallel processing over the temporal dimension using SMEB logic.
+        Args:
+            masked_kspace: Input k-space data (with temporal dimension).
+            mask: K-space mask.
+            num_low_frequencies: Number of low-frequency components to preserve.
+            max_img_size: Maximum image size for padding.
+        Returns:
+            Sensitivity maps and gating parameters.
+        """
         b, c, t, h, w, comp = masked_kspace.shape
 
+        # Mask the center frequencies
         if self.mask_center:
+            pad, num_low_freqs = self.get_pad_and_num_low_freqs(mask[:, :, 0, :, :, :], num_low_frequencies)
+            masked_kspace = masked_kspace.clone()
             for time_idx in range(t):
-                pad, num_low_freqs = self.get_pad_and_num_low_freqs(
-                    mask[:, :, time_idx, :, :, :], num_low_frequencies
-                )
-
-                masked_kspace[:, :, time_idx, :, :, :] = batched_mask_center(
+                modified_kspace = batched_mask_center(
                     masked_kspace[:, :, time_idx, :, :, :], pad, pad + num_low_freqs
                 )
+                masked_kspace[:, :, time_idx, :, :, :] = modified_kspace
 
+        # Pad without modifying the original tensor
         masked_kspace, _ = utils.pad_to_max_size(masked_kspace, max_img_size)
         b, c, t, h, w, comp = masked_kspace.shape
-        gates = torch.ones((b, c, t, h, w, 1), device=masked_kspace.device, dtype=masked_kspace.dtype)
-        images = torch.ones_like(masked_kspace)
-        sens = torch.ones_like(masked_kspace)
 
-        for time_idx in range(t):
-             # convert to image space
-            images[:, :, time_idx, :, :, :], batches = self.chans_to_batch_dim(fastmri.ifft2c(masked_kspace[:, :, time_idx, :, :, :]))
+        # Convert k-space to image domain
+        images = ifft2c(masked_kspace)
 
-            # estimate sensitivities
-            images[:, :, time_idx, :, :, :], gates[:, :, time_idx, :, :, :] = self.divide_root_sum_of_squares(
-                self.batch_chans_to_chan_dim(
-                    self.norm_unet(images[:, :, time_idx, :, :, :]), batches)
-            )
-            
-            # Normalize and apply gating
-            sens[:, :, time_idx, :, :, :] = images[:, :, time_idx, :, :, :] / (rss(complex_abs(images[:, :, time_idx, :, :, :]), dim=1).unsqueeze(1).unsqueeze(-1) + 1e-12)
-            sens[:, :, time_idx, :, :, :] = sens[:, :, time_idx, :, :, :] * gates[:, :, time_idx, :, :, :]
+        # Reshape to process all temporal slices as a batch
+        batched_images, batch_size = self.chans_to_batch_dim(images.view(b, c * t, h, w, comp))
+
+        # Pass through the U-Net
+        unet_output, gates = self.norm_unet(batched_images)
+
+        # Reshape the U-Net output back to the original dimensions
+        unet_output = self.batch_chans_to_chan_dim(unet_output, batch_size)
+        gates = gates.view(b, c, t, h, w, 1)
+
+        # Normalize sensitivities and apply gating
+        rss_norm = rss(complex_abs(unet_output), dim=1).unsqueeze(1).unsqueeze(-1)
+        sens = unet_output / (rss_norm + 1e-12)
+        sens = sens * gates
 
         return sens, gates
 
-    # def forward(
-    #     self,
-    #     masked_kspace: torch.Tensor,
-    #     num_low_frequencies: list,
-    #     max_img_size: list
-    # ) -> torch.Tensor:
-    #     b, c, t, h, w, comp = masked_kspace.shape
-
-    #     # Initialize ACS_mask and ACS_images
-    #     ACS_mask_slice = torch.zeros_like(masked_kspace[:, :, 0, :, :, :])  # Only once
-    #     ACS_images = torch.zeros((b, c, t, h, w, comp), device=masked_kspace.device, dtype=masked_kspace.dtype)
-
-    #     for time_idx in range(t):
-    #         # Reset the slice mask for each temporal slice
-    #         ACS_mask_slice.zero_()
-
-    #         # Calculate the ACS mask for each temporal slice
-    #         if len(num_low_frequencies) == 1:
-    #             num_low_freq_w = num_low_frequencies[0]
-    #             center_w = masked_kspace.shape[-2] // 2
-    #             half_num_low_freq_w = num_low_freq_w // 2
-    #             ACS_mask_slice[:, :, :, center_w - half_num_low_freq_w:center_w + half_num_low_freq_w, :] = 1
-    #         elif len(num_low_frequencies) == 2:
-    #             num_low_freq_h, num_low_freq_w = num_low_frequencies
-    #             center_h, center_w = masked_kspace.shape[-3] // 2, masked_kspace.shape[-2] // 2
-    #             half_low_freq_h, half_low_freq_w = num_low_freq_h // 2, num_low_freq_w // 2
-    #             ACS_mask_slice[:, :, center_h - half_low_freq_h:center_h + half_low_freq_h, center_w - half_low_freq_w:center_w + half_low_freq_w, :] = 1
-
-    #         # Apply the ACS mask to the current k-space slice
-    #         masked_kspace_slice = masked_kspace[:, :, time_idx, :, :, :]
-    #         ACS_kspace_slice = ACS_mask_slice * masked_kspace_slice
-
-    #         # Convert to image space
-    #         ACS_images_slice = ifft2c(ACS_kspace_slice)
-
-    #         # Store the result for the current temporal slice
-    #         ACS_images[:, :, time_idx, :, :, :] = ACS_images_slice
-
-    #     # Process the ACS images using the norm_net sequentially over temporal slices
-    #     ACS_images_padded, _ = utils.pad_to_max_size(ACS_images, max_img_size)
-    #     b, c, t, h, w, comp = ACS_images_padded.shape
-
-    #     updated_sens_maps = torch.zeros_like(ACS_images_padded)
-    #     gate = torch.zeros((b, c, t, h, w, 1), device=masked_kspace.device, dtype=masked_kspace.dtype)
-
-    #     for time_idx in range(t):
-    #         # Extract the current temporal slice
-    #         ACS_image_slice = ACS_images_padded[:, :, time_idx, :, :, :]
-
-    #         # Convert to batched channel format and pass through norm_net
-    #         ACS_image_slice = ACS_image_slice.view(b * c, 1, h, w, comp)            
-            
-    #         # Apply norm_net to the current temporal slice
-    #         sens_slice, gate_slice = self.norm_net(ACS_image_slice)
-            
-    #         sens_slice = sens_slice.view(b, c, h, w, comp)
-    #         updated_sens_maps[:, :, time_idx, :, :, :] = sens_slice
-    #         gate[:, :, time_idx, :, :, :] = gate_slice.view(b, c, h, w, 1)
-
-    #     # Normalize and apply gating
-    #     # sens = updated_sens_maps / (rss(complex_abs(updated_sens_maps), dim=1).unsqueeze(1).unsqueeze(-1) + 1e-12)
-    #     # sens = sens * gate
-        
-    #     # NOTE: we will unpad in our model later
-    #     # Unpad the outputs to the original size
-    #     # sensitivity = utils.unpad_from_max_size(sensitivity, original_size)
-    #     # gate = utils.unpad_from_max_size(gate, original_size)
-
-    #     return updated_sens_maps, gate
-
-        
+    
     
 class NormUnet(nn.Module):
     """

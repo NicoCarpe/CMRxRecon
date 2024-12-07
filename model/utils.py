@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import fastmri
 from fastmri.losses import SSIMLoss
 
+from typing import Tuple
 
 def ssimloss(x, y, max_val):
     # Ensure inputs are the same shape
@@ -140,11 +141,45 @@ def sens_reduce(x: torch.Tensor, sens_maps: torch.Tensor) -> torch.Tensor:
     ).sum(dim=1, keepdim=True)
 
 
+def chans_to_batch_dim(x: torch.Tensor) -> Tuple[torch.Tensor, int]:
+    """
+    Flattens the batch and coil dimensions into a single dimension.
+
+    Args:
+        x (torch.Tensor): Input tensor of shape (b, c, h, w, comp).
+
+    Returns:
+        Tuple[torch.Tensor, int]: 
+            - Flattened tensor of shape (b * c, 1, h, w, comp).
+            - Original batch size `b`.
+    """
+    b, c, h, w, comp = x.shape
+    return x.view(b * c, 1, h, w, comp), b
+
+
+def batch_chans_to_chan_dim(x: torch.Tensor, batch_size: int) -> torch.Tensor:
+    """
+    Restores the original batch and coil dimensions from a flattened dimension.
+
+    Args:
+        x (torch.Tensor): Input tensor of shape (b * c, 1, h, w, comp).
+        batch_size (int): Original batch size.
+
+    Returns:
+        torch.Tensor: Reshaped tensor of shape (b, c, h, w, comp).
+    """
+    bc, _, h, w, comp = x.shape
+    c = bc // batch_size
+    return x.view(batch_size, c, h, w, comp)
+
+
 def pad_to_max_size(tensor, max_size):
     """
-    Pad the input tensor to the specified max size.
+    Pad the input tensor to the specified max size, with even padding on both sides
+    of the spatial dimensions to keep the subject centered.
+
     Args:
-        tensor: Input tensor of shape: image--> (B, C, T, H, W, comp) or mask--> (B, T, H, W, comp) to be padded.
+        tensor: Input tensor of shape image--> (B, C, T, H, W, comp) or mask--> (B, T, H, W, comp).
         max_size: The target size to pad the tensor to, in the form (T, H, W).
     Returns:
         Padded tensor and the original shape of the tensor.
@@ -152,14 +187,27 @@ def pad_to_max_size(tensor, max_size):
     # Record the original size
     original_size = list(tensor.size())
 
-    # Pad the tensor
-    # PyTorch's padding expects order 
-    # [pad_t_left, pad_t_right, pad_h_left, pad_h_right, pad_w_left, pad_w_right]
+    # Calculate padding for temporal, height, and width dimensions
+    pad_t = max_size[0] - tensor.size(-4)
+    pad_h = max_size[1] - tensor.size(-3)
+    pad_w = max_size[2] - tensor.size(-2)
+
+    # Even padding for temporal dimension
+    pad_t_left = pad_t // 2
+    pad_t_right = pad_t - pad_t_left
+
+    # Even padding for height and width dimensions, handling odd padding
+    pad_h_left = pad_h // 2
+    pad_h_right = pad_h - pad_h_left
+    pad_w_left = pad_w // 2
+    pad_w_right = pad_w - pad_w_left
+
+    # PyTorch padding order: [pad_t_left, pad_t_right, pad_h_left, pad_h_right, pad_w_left, pad_w_right]
     padding = [
-        0, 0,                              # comp dim needs to be accounted for
-        0, max_size[2] - tensor.size(-2),  # w dimension
-        0, max_size[1] - tensor.size(-3),  # h dimension
-        0, max_size[0] - tensor.size(-4)   # t dimension
+        0, 0,                      # Comp dimension
+        pad_w_left, pad_w_right,   # W dimension
+        pad_h_left, pad_h_right,   # H dimension
+        pad_t_left, pad_t_right    # T dimension
     ]
 
     padded_tensor = nn.functional.pad(tensor, padding)
@@ -167,16 +215,34 @@ def pad_to_max_size(tensor, max_size):
     return padded_tensor, original_size
 
 
+
 def unpad_from_max_size(tensor, original_size):
     """
-    Unpad the input tensor to its original size.
+    Unpad the input tensor to its original size, ensuring that the odd paddings
+    from the `pad_to_max_size` function are correctly handled.
+
     Args:
         tensor: Input tensor to be unpadded.
         original_size: The original size to unpad the tensor to.
     Returns:
         Unpadded tensor.
     """
-    return tensor[:, :, :original_size[2], :original_size[3], :original_size[4], :]
+    # Extract the original dimensions
+    original_t, original_h, original_w = original_size[-4], original_size[-3], original_size[-2]
+
+    # Calculate the starting indices for unpadding
+    start_t = (tensor.size(-4) - original_t) // 2
+    start_h = (tensor.size(-3) - original_h) // 2
+    start_w = (tensor.size(-2) - original_w) // 2
+
+    # Handle the odd paddings by slicing exactly up to the original size
+    return tensor[
+        :, :, 
+        start_t : start_t + original_t, 
+        start_h : start_h + original_h, 
+        start_w : start_w + original_w, :
+    ]
+
 
 
 def create_padding_mask(tensor, max_size):
