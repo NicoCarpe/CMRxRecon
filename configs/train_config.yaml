@@ -1,12 +1,12 @@
 seed: 42
 mode: 'train'
-num_gpus: 2
+num_gpus: 4
 exp_name: 'cmrxrecon2024'
-data_path: /home/nicocarp/scratch/CMR-Reconstruction/datasets/CMR_2024/ChallengeData/MultiCoil/
-output_dir: /home/nicocarp/scratch/CMR-Reconstruction/outputs/
-checkpoint_dir: /home/nicocarp/scratch/CMR-Reconstruction/pretrained_models/
+data_path: /home/nicocarp/scratch/CMRxRecon/datasets/CMR_2024/ChallengeData/MultiCoil/
+output_dir: /home/nicocarp/scratch/CMRxRecon/outputs/
+checkpoint_dir: /home/nicocarp/scratch/CMRxRecon/pretrained_models/
 challenge: 'multicoil'
-num_workers: 4 # recommended when gpus = 2, try 8 if gpus = 4
+num_workers: 1 
 run_preprocessing: false
 resume_from_checkpoint: false
 
@@ -14,22 +14,22 @@ resume_from_checkpoint: false
 coils: 10
 num_heads: [3, 6, 9, 12]
 window_size: [2, 8, 8]
-depths: [2, 2, 6, 2]
+depths: [2, 2, 4, 2]
 embed_dim: 96
 use_amp: True
-num_recurrent: 8 
+num_recurrent: 8
 sens_chans: 8
-alpha: 0.7
-beta: 0.5 
-lambda_SM: 0.3   
+alpha: 1.0
+beta: 1000.0 
+lambda_SM: 1000.0   
 
 # Training parameters
-max_epochs: 12   
-gradient_clip_val: 0.01
+max_epochs: 4   
+gradient_clip_val: 0.005
 use_checkpoint: True
-accumulate_grad_batches: 1  # for gradient accumulation in ddp
+accumulate_grad_batches: 6  # for gradient accumulation in ddp
 combine_train_val: true
-sample_rate: 1.0
+sample_rate: 0.025
 batch_size: 1
 lr: 0.0005
 lr_step_size: 10

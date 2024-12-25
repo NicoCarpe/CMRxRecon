@@ -1,11 +1,11 @@
 #!/bin/bash -l
 #SBATCH -J cmrxrecon_train
-#SBATCH --time=1:20:00
+#SBATCH --time=0-07:00:00
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=2
-#SBATCH --gpus-per-node=v100l:2            
-#SBATCH --cpus-per-task=2                  
-#SBATCH --mem=96GB                                                 
+#SBATCH --ntasks-per-node=4
+#SBATCH --gpus-per-node=v100l:4            
+#SBATCH --cpus-per-task=1                  
+#SBATCH --mem=48GB                                                 
 #SBATCH --account=def-punithak
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=ngcarpen@ualberta.ca
@@ -16,7 +16,7 @@ export HDF5_USE_FILE_LOCKING=FALSE
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
 # Set PROJECT_ROOT and PYTHONPATH
-export PROJECT_ROOT=/home/nicocarp/scratch/CMR-Reconstruction
+export PROJECT_ROOT=/home/nicocarp/scratch/CMRxRecon
 export PYTHONPATH=$PROJECT_ROOT:$PYTHONPATH
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 

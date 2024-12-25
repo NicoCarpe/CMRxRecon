@@ -52,7 +52,7 @@ if __name__ == '__main__':
     parser.add_argument(
         "--data_path",
         type=str,
-        default="~/scratch/CMR-Reconstruction/datasets/CMR_2024/ChallengeData/MultiCoil/",
+        default="~/scratch/CMRxRecon/datasets/CMR_2024/ChallengeData/MultiCoil/",
         help="Path to the multi-coil MATLAB folder.",
     )
 

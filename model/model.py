@@ -43,13 +43,8 @@ class IRB(nn.Module):
         # Convert to channel dimension representation
         target_img_f = utils.complex_to_chan_dim(target_img_f)
 
-        #target_img_f = rearrange(target_img_f, 'b c t h w -> b c h w t')
-
         # SwinTransformer3D forward pass
         output_SwinTransformer3D = self.SwinTransformer3D(target_img_f)
-
-        #target_img_f = rearrange(target_img_f, 'b c h w t -> b c t h w')
-        #output_SwinTransformer3D = rearrange(output_SwinTransformer3D, 'b c h w t -> b c t h w')
 
         # Convert back to complex values
         output_SwinTransformer3D = utils.chan_complex_to_last_dim(output_SwinTransformer3D)
@@ -148,7 +143,7 @@ class ReconModel(nn.Module):
             RSS images, sensitivity maps, and final image.
         """
 
-        # # NOTE: we applied model checkpointing to each of the networks in the IRB, SMEB, and SMRB
+        # # NOTE: we applied model checkpointing to each of the networks in the IRB, SMEB, and SMRB due to the large gradients
         
         # Initialize sensitivity maps with checkpointing
         if self.coils == 1:

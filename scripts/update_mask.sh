@@ -25,4 +25,4 @@ source $SLURM_TMPDIR/env/bin/activate
 pip install --no-index h5py
 
 # Run the Python script
-srun python /home/nicocarp/scratch/CMR-Reconstruction/scripts/update_masks.py
+srun python /home/nicocarp/scratch/CMRxRecon/scripts/update_masks.py

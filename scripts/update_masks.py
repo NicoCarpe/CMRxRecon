@@ -48,7 +48,7 @@ def update_mask_paths(base_folder, task):
             print(f"Updated masks path: {masks_path} for {h5_file}", flush=True)
 
 if __name__ == '__main__':
-    base_folder = "/home/nicocarp/scratch/CMR-Reconstruction/datasets/CMR_2024/ChallengeData/MultiCoil/"
+    base_folder = "/home/nicocarp/scratch/CMRxRecon/datasets/CMR_2024/ChallengeData/MultiCoil/"
     task = 2 
 
     update_mask_paths(base_folder, task)

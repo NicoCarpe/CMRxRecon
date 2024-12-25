@@ -34,7 +34,7 @@ class PreNorm3D(nn.Module):
     def __init__(self, dim, fn):
         super().__init__()
         self.norm = nn.LayerNorm(dim)
-        # self.norm = layer_norm(dim)
+        #self.norm = layer_norm(dim)
         self.fn = fn
 
     def forward(self, x, **kwargs):

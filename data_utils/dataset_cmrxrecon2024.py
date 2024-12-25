@@ -48,7 +48,7 @@ class CombinedVolumeDataset(torch.utils.data.Dataset):
         sample_rates: Optional[Sequence[Optional[float]]] = None,
         volume_sample_rates: Optional[Sequence[Optional[float]]] = None,
         use_dataset_cache: bool = False,
-        dataset_cache_file: Union[str, Path, os.PathLike] = "/home/nicocarp/scratch/CMR-Reconstruction/outputs/dataset_cache.pkl",
+        dataset_cache_file: Union[str, Path, os.PathLike] = "/home/nicocarp/scratch/CMRxRecon/outputs/dataset_cache.pkl",
         num_cols: Optional[Tuple[int]] = None,
         raw_sample_filter: Optional[Callable] = None,
     ):
@@ -146,7 +146,7 @@ class VolumeDataset(torch.utils.data.Dataset):
         use_dataset_cache: bool = False,
         sample_rate: Optional[float] = None,
         volume_sample_rate: Optional[float] = None,
-        dataset_cache_file: Union[str, Path, os.PathLike] = "/home/nicocarp/scratch/CMR-Reconstruction/outputs/dataset_cache.pkl",
+        dataset_cache_file: Union[str, Path, os.PathLike] = "/home/nicocarp/scratch/CMRxRecon/outputs/dataset_cache.pkl",
         num_cols: Optional[Tuple[int]] = None,
         raw_sample_filter: Optional[Callable] = None,
     ):
@@ -207,6 +207,10 @@ class VolumeDataset(torch.utils.data.Dataset):
         if self.dataset_cache_file.exists() and use_dataset_cache:
             with open(self.dataset_cache_file, "rb") as f:
                 dataset_cache = pickle.load(f)
+
+            logging.info(f"Using dataset cache from {self.dataset_cache_file}.")
+            logging.info(f"Loaded {len(dataset_cache.get(root, []))} samples from cache.")
+
         else:
             dataset_cache = {}
 
@@ -222,7 +226,7 @@ class VolumeDataset(torch.utils.data.Dataset):
 
             # Iterate through all the modalities
             for data_type in data_type_list:
-                task_dir = os.path.join(root, data_type, 'TrainingSet', 'FullSample_test')
+                task_dir = os.path.join(root, data_type, 'TrainingSet', 'FullSample')
 
                 # Iterate through all of the patients
                 for patient_dir_info in os.scandir(task_dir):
@@ -249,35 +253,33 @@ class VolumeDataset(torch.utils.data.Dataset):
                                     'shape': kdata.shape,  # (c, t, h, w, z, 2)
                                     'padding_left': 0,
                                     'padding_right': num_slices,
-                                    'masks': patient_dir.replace(f"FullSample_test", f"Mask_Task2")
+                                    'masks': patient_dir.replace(f"FullSample", f"Mask_Task2")
                                 }
 
                                 # Get the mask directory from attributes
                                 mask_dir = attrs['masks']
                                 modality_view = Path(full_ks_file_path).stem.replace('.h5', '')
                                 
-                                # Divide the 3D image into individual 2D slices along the time axis
-                                for time_index in range(kdata.shape[1]):  # Iterate over the time dimension
-                                    for slice_index in range(kdata.shape[4]):  # Iterate over the slice dimension
-                                        # Filter the available masks for the current modality_view
-                                        matching_masks = [
-                                            mask_file for mask_file in os.listdir(mask_dir) if modality_view in mask_file
-                                        ]
-                                        
-                                        if matching_masks:
-                                            # Randomly choose one mask from the matching masks
-                                            chosen_mask = random.choice(matching_masks)
-                                            mask_path = os.path.join(mask_dir, chosen_mask)
+                                for slice_index in range(kdata.shape[4]):  # Iterate over the slice dimension
+                                    # Filter the available masks for the current modality_view
+                                    matching_masks = [
+                                        mask_file for mask_file in os.listdir(mask_dir) if modality_view in mask_file
+                                    ]
+                                    
+                                    if matching_masks:
+                                        # Randomly choose one mask from the matching masks
+                                        chosen_mask = random.choice(matching_masks)
+                                        mask_path = os.path.join(mask_dir, chosen_mask)
 
-                                            # Add the sample with both time and slice indices
-                                            self.raw_samples.append(
-                                                CMRxReconRawDataSample(
-                                                    full_ks_file_path,  # Path to the HDF5 file
-                                                    (time_index, slice_index),  # Tuple of time and slice indices
-                                                    attrs,                      # Attributes remain the same
-                                                    mask_path                   # Path to the mask
-                                                )
+                                        # Add the sample with both time and slice indices
+                                        self.raw_samples.append(
+                                            CMRxReconRawDataSample(
+                                                full_ks_file_path,  # Path to the HDF5 file
+                                                slice_index, 
+                                                attrs,                      # Attributes remain the same
+                                                mask_path                   # Path to the mask
                                             )
+                                        )
 
 
                                 # NOTE: This is the code to use all the available masks for each slice
@@ -292,7 +294,7 @@ class VolumeDataset(torch.utils.data.Dataset):
                                 #             self.raw_samples.append(
                                 #                 CMRxReconRawDataSample2024(
                                 #                     full_ks_file_path, 
-                                #                     slice_ind, 
+                                #                     (time_index, slice_index), 
                                 #                     data_type, 
                                 #                     mask_path
                                 #                 )
@@ -303,6 +305,7 @@ class VolumeDataset(torch.utils.data.Dataset):
             if dataset_cache.get(root) is None and use_dataset_cache:
                 dataset_cache[root] = self.raw_samples
                 logging.info(f"Saving dataset cache to {self.dataset_cache_file}.")
+                logging.info(f"Caching {len(self.raw_samples)} samples in {self.dataset_cache_file}.")
                 with open(self.dataset_cache_file, "wb") as cache_f:
                     pickle.dump(dataset_cache, cache_f)
         else:

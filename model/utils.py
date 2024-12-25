@@ -32,18 +32,18 @@ def ssimloss(x, y, max_val):
     return ssim_loss
 
 
-def combined_loss(target_img, rec_img, max_val, loss_sc, alpha=0.5, beta=0.5, lambda_SM=0.1):
-    # SSIM and L1 Loss for Image Reconstruction
-    loss_ssim = ssimloss(rec_img, target_img, max_val)
-    loss_l1_image = F.l1_loss(rec_img, target_img)
-    
-    # Weighted combination of SSIM and L1 for image loss
-    loss_image = beta * loss_ssim + (1 - beta) * loss_l1_image
-    
-    # Final combined loss: Image loss with alpha scaling + Sensitivity Map loss with lambda scaling
-    combined_loss = alpha * loss_image + lambda_SM * loss_sc
-    
-    return combined_loss
+def normalize_kspace(kspace, epsilon=1e-8):
+    # kspace: (B, C, T, H, W, 2)
+    # Compute magnitude of complex k-space: sqrt(real^2 + imag^2)
+    kspace_magnitude = torch.sqrt(kspace[..., 0]**2 + kspace[..., 1]**2)  # (B, C, T, H, W)
+
+    # Find the maximum magnitude value over the spatial dimensions (H, W)
+    max_val = kspace_magnitude.amax(dim=(-2, -1), keepdim=True)  # Reduces over H, W
+
+    # Normalize by the maximum value, adding a small epsilon for numerical stability
+    normalized_kspace = kspace_magnitude / (max_val + epsilon)
+    return normalized_kspace
+
 
 
 def gaussian_kernel_1d(sigma):
@@ -105,14 +105,14 @@ def complex_to_chan_dim(x: torch.Tensor) -> torch.Tensor:
     shape_len = len(x.shape)
 
     if shape_len == 6:
-        b, c, t, h, w, two = x.shape
-        assert two == 2
-        return x.permute(0, 5, 1, 2, 3, 4).reshape(b, 2 * c, t, h, w)
+        b, c, t, h, w, comp = x.shape
+        assert comp == 2
+        return x.permute(0, 5, 1, 2, 3, 4).reshape(b, comp * c, t, h, w)
     
     elif shape_len == 5:
-        b, c, h, w, two = x.shape
-        assert two == 2
-        return x.permute(0, 4, 1, 2, 3).reshape(b, 2 * c, h, w)
+        b, c, h, w, comp = x.shape
+        assert comp == 2
+        return x.permute(0, 4, 1, 2, 3).reshape(b, comp * c, h, w)
 
 
 def chan_complex_to_last_dim(x: torch.Tensor) -> torch.Tensor:
@@ -256,3 +256,56 @@ def create_padding_mask(tensor, max_size):
         mask[..., dim:] = 0
         
     return mask
+
+
+
+def matlab_round(n):
+    if n > 0:
+        return int(n + 0.5)
+    else:
+        return int(n - 0.5)
+
+
+def _crop(a, crop_shape):
+    indices = [
+        (math.floor(dim/2) + math.ceil(-crop_dim/2),
+         math.floor(dim/2) + math.ceil(crop_dim/2))
+        for dim, crop_dim in zip(a.shape, crop_shape)
+    ]
+    return a[indices[0][0]:indices[0][1], indices[1][0]:indices[1][1], indices[2][0]:indices[2][1], indices[3][0]:indices[3][1]]
+
+def crop_submission(a, attrs):
+    # Determine modality type
+    modality_view = attrs.get('modality_view', '').lower()
+    if 'cine' in modality_view:
+        modality_type = 'cine'
+    elif 't1map' in modality_view:
+        modality_type = 'T1map'
+    elif 't2map' in modality_view:
+        modality_type = 'T2map'
+    else:
+        modality_type = 'other'
+
+    sx, sy, sz, st = a.shape
+    
+    # Central slices logic
+    if sz >= 3:
+        start_slice = (sz // 2) - 1
+        end_slice = start_slice + 2
+        a = a[:, :, start_slice:end_slice, :]
+    
+    # Time frames logic
+    if modality_type == 'cine':
+        # Use first 3 time frames
+        a = a[..., :3]
+    elif modality_type in ['T1map','T2map']:
+        # Use all time frames
+        pass  # a stays unchanged for time dimension
+    else:
+        # For black-blood or other data:
+        a = a[..., :1]
+    
+    # Spatial cropping
+    cropped = _crop(a, (int(round(sx/3)), int(round(sy/2)), a.shape[2], a.shape[3]))
+    return cropped
+

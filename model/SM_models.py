@@ -136,7 +136,7 @@ class SMEB3D(nn.Module):
         rss_norm = rss(complex_abs(unet_output), dim=1).unsqueeze(1).unsqueeze(-1)
         sens = unet_output / (rss_norm + 1e-12)
         sens = sens * gates
-
+        
         return sens, gates
 
     
@@ -368,14 +368,13 @@ class UNet3D(nn.Module):
 
         output = self.conv_sl(output)
 
-        #### learnable Gaussian std ####
+        ### learnable Gaussian std ####
         sigma_value = torch.clamp(self.stds[cnt], min=1e-9, max=7)
         sigma = (0, sigma_value.item(), sigma_value.item())  # No smoothing on the temporal dimension
         output_ = utils.gaussian_smooth_3d(output.view(-1, 1, *output.shape[-3:]), sigma=sigma)
         output = output_.view(output.shape)
 
-        # TODO: This is a little ugly, need to adjust the hardcoding
-        output = F.interpolate(output, scale_factor=2**(self.num_pools-3), mode='trilinear', align_corners=False)
+        output = F.interpolate(output, scale_factor=2**(self.num_pools-3), mode='trilinear')
 
         #### normal ####
         norm_conv = self.norm_conv(output)
@@ -511,7 +510,7 @@ class ConvBlockSM3D(nn.Module):
         ))
 
         #### Spatiotemporal Attention ####
-        self.STA = SpatiotemporalAttention(in_channels=in_chans)
+        self.SA = SpatiotemporalAttention(in_channels=in_chans)
 
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         """
@@ -524,7 +523,7 @@ class ConvBlockSM3D(nn.Module):
         output = self.layers(image)
 
         #### Spatiotemporal Attention ###
-        output = self.STA(output) * output
+        output = self.SA(output) * output
 
         return output
 
@@ -545,48 +544,6 @@ class SpatialAttention(nn.Module):
         out = torch.cat([avgout, maxout], dim=1)
         out = self.sigmoid(self.conv2d(out))
         return out
-
-# class SpatiotemporalAttention(nn.Module):
-#     def __init__(self, in_channels):
-#         super(SpatiotemporalAttention, self).__init__()
-
-#         # Spatial attention (2D convolution)
-#         self.spatial_conv = nn.Conv2d(in_channels, out_channels=1, kernel_size=7, stride=1, padding=3)
-
-#         # Temporal attention (1D convolution)
-#         self.temporal_conv = nn.Conv1d(in_channels=1, out_channels=1, kernel_size=3, stride=1, padding=1)
-
-#         self.sigmoid = nn.Sigmoid()
-
-#     def forward(self, image):
-#         # image: B, C, T, X, Y
-#         B, C, T, X, Y = image.shape
-
-#         #### Spatial Attention ####
-#         avgout = torch.mean(image, dim=1, keepdim=True)  # Shape: (B, 1, T, X, Y)
-#         maxout, _ = torch.max(image, dim=1, keepdim=True)  # Shape: (B, 1, T, X, Y)
-#         out = torch.cat([avgout, maxout], dim=1)  # Shape: (B, 2, T, X, Y)
-
-#         # Reshape for 2D convolution: (B * T, 2, X, Y)
-#         out = out.permute(0, 2, 1, 3, 4).reshape(B * T, 2, X, Y)
-#         out = self.spatial_conv(out)  # Apply 2D convolution on (X, Y)
-#         out = self.sigmoid(out)  # Spatial attention weights: (B * T, 1, X, Y)
-
-#         # Reshape back to (B, T, 1, X, Y)
-#         out = out.reshape(B, T, 1, X, Y)
-
-#         #### Temporal Attention ####
-#         # Reshape for 1D convolution: (B * X * Y, 1, T)
-#         out = out.permute(0, 3, 4, 2, 1).reshape(B * X * Y, 1, T)
-#         out = self.temporal_conv(out)  # Apply 1D convolution on temporal dimension (T)
-#         out = self.sigmoid(out)  # Temporal attention weights: (B * X * Y, 1, T)
-
-#         # Reshape back to (B, X, Y, 1, T), then permute to (B, 1, T, X, Y)
-#         out = out.reshape(B, X, Y, 1, T).permute(0, 3, 4, 1, 2).contiguous()
-
-#         return out  # Attention weights for both spatial and temporal dimensions
-
-
 
 
 class SpatiotemporalAttention(nn.Module):

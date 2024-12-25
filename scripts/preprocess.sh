@@ -16,7 +16,7 @@ export HDF5_USE_FILE_LOCKING=FALSE
 export OMP_NUM_THREADS=6
 
 # Set PROJECT_ROOT and PYTHONPATH
-export PROJECT_ROOT=/home/nicocarp/scratch/CMR-Reconstruction
+export PROJECT_ROOT=/home/nicocarp/scratch/CMRxRecon
 export PYTHONPATH=$PROJECT_ROOT:$PYTHONPATH
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 

@@ -127,7 +127,7 @@ class CmrxReconDataModule(pl.LightningDataModule):
         self.val_transform = val_transform
         self.combine_train_val = combine_train_val
         self.sample_rate = sample_rate
-        self.val_sample_rate = val_sample_rate
+        self.val_sample_rate = sample_rate              # for now we will just have the sample rates tied to a common input value
         self.volume_sample_rate = volume_sample_rate
         self.val_volume_sample_rate = val_volume_sample_rate
         self.train_filter = train_filter

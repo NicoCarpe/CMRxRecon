@@ -19,9 +19,9 @@ model:
   scale: 0.1
 
 data:
-  model_path: /home/nicocarp/scratch/CMR-Reconstruction/pretrained_models/_model_name_
-  input_dir: /home/nicocarp/scratch/CMR-Reconstruction/datasets/CMR_2024/
-  output_dir: /home/nicocarp/scratch/CMR-Reconstruction/outputs
+  model_path: /home/nicocarp/scratch/CMRxRecon/pretrained_models/_model_name_
+  input_dir: /home/nicocarp/scratch/CMRxRecon/datasets/CMR_2024/
+  output_dir: /home/nicocarp/scratch/CMRxRecon/outputs
   center_crop: true               # calls the run4ranking script for the cmrxrecon2024 challenge
   evaluate_set: 'ValidationSet'
   batch_size: 1

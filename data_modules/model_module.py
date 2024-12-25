@@ -22,7 +22,7 @@ import pytorch_lightning as pl
 from fastmri import rss, complex_abs, ifft2c, evaluate, save_reconstructions
 
 from model.model import ReconModel
-from model.utils import ssimloss, combined_loss, sens_expand
+from model.utils import ssimloss, normalize_kspace, sens_expand, crop_submission  
 
 
 class DistributedMetricSum(Metric):
@@ -71,47 +71,66 @@ class ReconMRIModule(pl.LightningModule):
     #########################################################################################################
     # Train Step
     #########################################################################################################
-
     def training_step(self, batch, batch_idx):
         masked_kspace, mask, target_k, attrs, max_img_size = batch
         num_low_frequencies = attrs['num_low_frequencies']
 
-        # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        # masked_kspace = masked_kspace.to(device)
-        # mask = mask.to(device)
-        # target_k = target_k.to(device)
-
-        # Forward pass 
-        # Shape of booth outputs: (B, C, T, H, W, comp)
+        # Forward pass (B, C, T, H, W, comp)
         rec_img, sens_maps = self(masked_kspace, mask, num_low_frequencies, attrs, max_img_size)
 
-        # NOTE: this is a little ugly but it is easier to calculate this before we apply complex_abs and rss
-        # L1 Loss for Sensitivity Map Consistency
-        loss_sensitivity_consistency = F.l1_loss(mask * sens_expand(rec_img, sens_maps), masked_kspace)
-    
-        # New Shape: (B, T, H, W)
-        target_img = rss(complex_abs(ifft2c(target_k)), dim=1)
-        rec_img = rss(complex_abs(rec_img), dim=1)
+        # Predicted k-space
+        pred_kspace = sens_expand(rec_img, sens_maps)
 
-        loss = ssimloss(target_img, rec_img, attrs['max'])
+        # K-space fidelity loss
+        pred_kspace_norm = normalize_kspace(pred_kspace)
+        target_k_norm = normalize_kspace(target_k)
+        loss_fidelity = F.mse_loss(pred_kspace_norm, target_k_norm)
 
-        # Compute combined loss
-        # loss = combined_loss(
-        #     target_img=target_img,
-        #     rec_img=rec_img,
-        #     max_val=attrs['max'],
-        #     loss_sc = loss_sensitivity_consistency, 
-        #     alpha=self.hparams.alpha,
-        #     beta=self.hparams.beta,
-        #     lambda_SM=self.hparams.lambda_SM,
-        # )
+        # Sensitivity map consistency loss
+        loss_sensitivity_consistency = F.l1_loss(mask * pred_kspace, masked_kspace)
 
-        
+        # Image-domain SSIM loss
+        target_img = rss(complex_abs(ifft2c(target_k)), dim=1)  # (B, T, H, W)
+        rec_img_mag = rss(complex_abs(rec_img), dim=1)          # (B, T, H, W)
+        loss_ssim = ssimloss(target_img, rec_img_mag, attrs['max'])
 
-        # Log loss
-        self.log("train_loss", loss.detach(), on_step=True, on_epoch=True, prog_bar=True, batch_size=1, sync_dist=True)
+        # Combine losses
+        loss = (self.hparams.alpha * loss_ssim +
+                self.hparams.beta * loss_fidelity +
+                self.hparams.lambda_SM * loss_sensitivity_consistency)
+
+        # Log losses
+        loss_dict = {
+            "train_loss_ssim": loss_ssim.detach(),
+            "train_loss_fidelity": loss_fidelity.detach(),
+            "train_loss_sensitivity_consistency": loss_sensitivity_consistency.detach(),
+            "train_loss": loss.detach()
+        }
+        self.log_dict(loss_dict, on_step=True, on_epoch=True, prog_bar=True, batch_size=1, sync_dist=True)
+
+        # Optionally log images every N batches
+        if batch_idx % 200 == 0:  # adjust frequency as desired
+            # Prepare images for logging
+            masked_target = rss(complex_abs(ifft2c(masked_kspace)), dim=1)
+            sens_maps_mag = rss(complex_abs(sens_maps), dim=1)
+            
+            # Log a figure with reconstruction, target, sensitivity maps, and masked input
+            self.image_figure(
+                rec_img_mag, 
+                target_img, 
+                sens_maps_mag, 
+                masked_target, 
+                step=self.global_step, 
+                mode="Training"
+            )
+
+            # If you also want to log just a single image:
+            # Normalize and log one of the training images
+            output_vis = rec_img_mag[0].unsqueeze(0)
+            self.log_image("train/reconstruction", output_vis)
 
         return loss
+
 
     #########################################################################################################
     # Validation Epoch Start
@@ -133,63 +152,71 @@ class ReconMRIModule(pl.LightningModule):
         masked_kspace, mask, target_k, attrs, max_img_size = batch
         num_low_frequencies = attrs['num_low_frequencies']
 
-        # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        # masked_kspace = masked_kspace.to(device)
-        # mask = mask.to(device)
-        # target_k = target_k.to(device)
-
-        # Forward pass 
-        # Shape of booth outputs: (B, C, T, H, W, comp)
+        # Forward pass: (B, C, T, H, W, comp)
         rec_img, sens_maps = self(masked_kspace, mask, num_low_frequencies, attrs, max_img_size)
-        
-        # L1 Loss for Sensitivity Map Consistency
-        loss_sensitivity_consistency = F.l1_loss(mask * sens_expand(rec_img, sens_maps), masked_kspace)
-    
-        # New Shape: (B, T, H, W)
-        target_img = rss(complex_abs(ifft2c(target_k)), dim=1)
-        rec_img = rss(complex_abs(rec_img), dim=1)
 
-        val_loss = ssimloss(target_img, rec_img, attrs['max'])
+        # Compute predicted k-space
+        pred_kspace = sens_expand(rec_img, sens_maps)  # (B, C, T, H, W, 2)
 
-        # Compute combined loss
-        # val_loss = combined_loss(
-        #     target_img=target_img,
-        #     rec_img=rec_img,
-        #     max_val=attrs["max"],
-        #     loss_sc =  loss_sensitivity_consistency,
-        #     alpha=self.hparams.alpha,
-        #     beta=self.hparams.beta,
-        #     lambda_SM=self.hparams.lambda_SM,
-        # )
+        # Normalize k-space and compute fidelity loss
+        pred_kspace_norm = normalize_kspace(pred_kspace)
+        target_k_norm = normalize_kspace(target_k)
+        loss_fidelity = F.mse_loss(pred_kspace_norm, target_k_norm)
+
+        # Sensitivity map consistency loss
+        loss_sensitivity_consistency = F.l1_loss(mask * pred_kspace, masked_kspace)
+
+        # Image-domain SSIM loss
+        target_img = rss(complex_abs(ifft2c(target_k)), dim=1)  # (B, T, H, W)
+        rec_img_mag = rss(complex_abs(rec_img), dim=1)          # (B, T, H, W)
+        val_loss_ssim = ssimloss(target_img, rec_img_mag, attrs['max'])
+
+        # Handle any NaNs
+        val_loss_ssim = torch.nan_to_num(val_loss_ssim, nan=1.0)
+        loss_fidelity = torch.nan_to_num(loss_fidelity, nan=1.0)
+        loss_sensitivity_consistency = torch.nan_to_num(loss_sensitivity_consistency, nan=1.0)
+
+        # Combine validation losses
+        val_loss = (
+            self.hparams.alpha * val_loss_ssim +
+            self.hparams.beta * loss_fidelity +
+            self.hparams.lambda_SM * loss_sensitivity_consistency
+        )
 
         # Check output and target dimensions
-        if rec_img.ndim != 4 or target_img.ndim != 4:
-            raise RuntimeError(f"Unexpected output or target size from validation_step: {rec_img.shape}, {target_img.shape}")
+        if rec_img_mag.ndim != 4 or target_img.ndim != 4:
+            raise RuntimeError(f"Unexpected output or target size from validation_step: {rec_img_mag.shape}, {target_img.shape}")
 
-        # Pick a set of images to log if we don't have one already
+        # Determine validation dataset size based on the type of val_dataloaders
+        if isinstance(self.trainer.val_dataloaders, list):
+            val_dataset_size = len(self.trainer.val_dataloaders[0].dataset)
+        else:
+            val_dataset_size = len(self.trainer.val_dataloaders.dataset)
+
+        # Initialize val_log_indices if not already set
         if self.val_log_indices is None:
+            # Use the validation dataset size to select random indices
             self.val_log_indices = list(
-                np.random.permutation(len(self.trainer.val_dataloaders.dataset))[: self.num_log_images]
+                np.random.permutation(val_dataset_size)[: self.num_log_images]
             )
 
-        # Log images to TensorBoard
-        if isinstance(batch_idx, int):
-            batch_indices = [batch_idx]
-        else:
-            batch_indices = batch_idx
+        # Determine which samples to log
+        for i in range(min(self.num_log_images, masked_kspace.size(0))):
+            b_idx = self.val_log_indices[i]  # Use pre-selected indices
+            key = f"val_images_idx_{b_idx}"
+            target = target_img[i].unsqueeze(0)
+            output = rec_img_mag[i].unsqueeze(0)
+            error = torch.abs(target - output)
 
-        for i, b_idx in enumerate(batch_indices):
-            if b_idx in self.val_log_indices:
-                key = f"val_images_idx_{b_idx}"
-                target = target_img[i].unsqueeze(0)
-                output = rec_img[i].unsqueeze(0)
-                error = torch.abs(target - output)
-                output = output / output.max()
-                target = target / target.max()
-                error = error / error.max()
-                self.log_image(f"{key}/target", target)
-                self.log_image(f"{key}/reconstruction", output)
-                self.log_image(f"{key}/error", error)
+            # Normalize for logging
+            output = output / (output.max() + 1e-8)
+            target = target / (target.max() + 1e-8)
+            error = error / (error.max() + 1e-8)
+
+            # Log images
+            self.log_image(f"{key}/target", target)
+            self.log_image(f"{key}/reconstruction", output)
+            self.log_image(f"{key}/error", error)
 
         # Initialize the metrics using defaultdict(dict)
         mse_vals = defaultdict(dict)
@@ -202,7 +229,7 @@ class ReconMRIModule(pl.LightningModule):
         for i, fname in enumerate(attrs["fname"]):
             slice_num = int(attrs["slice_ind"][i].cpu())
             maxval = attrs["max"][i].cpu().numpy()
-            output = rec_img[i].cpu().numpy()
+            output = rec_img_mag[i].cpu().numpy()
             target = target_img[i].cpu().numpy()
 
             # Loop over frames to store metrics in the defaultdicts
@@ -210,9 +237,9 @@ class ReconMRIModule(pl.LightningModule):
                 target_slice = target[frame]
                 output_slice = output[frame]
 
-                # Add batch and channel dimensions for SSIM calculation
-                target_slice = target_slice[None, ...]  # Shape: (1, H, W)
-                output_slice = output_slice[None, ...]  # Shape: (1, H, W)
+                # Add batch dimension
+                target_slice = target_slice[None, ...]  # (1, H, W)
+                output_slice = output_slice[None, ...]  # (1, H, W)
 
                 # Compute metrics and store them in the defaultdict
                 mse_vals[fname][frame] = torch.tensor(evaluate.mse(target_slice, output_slice)).view(1)
@@ -226,7 +253,7 @@ class ReconMRIModule(pl.LightningModule):
             "fname": attrs["fname"],
             "slice_num": attrs["slice_ind"],
             "max_value": attrs["max"],
-            "output": rec_img,
+            "output": rec_img_mag,
             "target": target_img,
             "val_loss": val_loss,
             "mse_vals": dict(mse_vals),
@@ -244,20 +271,19 @@ class ReconMRIModule(pl.LightningModule):
         else:
             total_val_batches = self.trainer.num_val_batches
 
-        # make figures for the first and last image of the epoch
-        if batch_idx == 0 or batch_idx == (total_val_batches - 1):
+        # Make figures every 200 batches if desired
+        if (batch_idx % 200 == 0):
             masked_target = rss(complex_abs(ifft2c(masked_kspace)), dim=1)
             sens_maps = rss(complex_abs(sens_maps), dim=1)
 
             self.image_figure(
-                rec_img, 
+                rec_img_mag, 
                 target_img, 
                 sens_maps,
                 masked_target, 
                 step=self.global_step, 
                 mode="Validation"
             )
-
 
         # Return the loss for logging
         return val_loss
@@ -337,10 +363,20 @@ class ReconMRIModule(pl.LightningModule):
         )
 
         
+        # Log final validation loss
         self.log("validation_loss", val_loss / tot_slice_examples, prog_bar=True)
+
+        # Log final metrics to TensorBoard
         for metric, value in metrics.items():
             self.log(f"val_metrics/{metric}", value / tot_examples)
 
+        # Optionally print them to console here
+        self.print(
+            f"Epoch {self.current_epoch} -- "
+            f"Val NMSE: {(metrics['nmse']/tot_examples).item():.6f}, "
+            f"Val SSIM: {(metrics['ssim']/tot_examples).item():.6f}, "
+            f"Val PSNR: {(metrics['psnr']/tot_examples).item():.2f}"
+        )
 
     #########################################################################################################
     # Test Epoch End
@@ -402,10 +438,10 @@ class ReconMRIModule(pl.LightningModule):
         masked_target_to_log = masked_target[0, 0, :, :].float().cpu()
 
         # # Normalize images
-        # rec_img_to_log = (rec_img_to_log - rec_img_to_log.min()) / (rec_img_to_log.max() - rec_img_to_log.min() + 1e-8)
-        # target_img_to_log = (target_img_to_log - target_img_to_log.min()) / (target_img_to_log.max() - target_img_to_log.min() + 1e-8)
-        # sens_maps_to_log = (sens_maps_to_log - sens_maps_to_log.min()) / (sens_maps_to_log.max() - sens_maps_to_log.min() + 1e-8)
-        # masked_target_to_log = (masked_target_to_log - masked_target_to_log.min()) / (masked_target_to_log.max() - masked_target_to_log.min() + 1e-8)
+        rec_img_to_log = (rec_img_to_log - rec_img_to_log.min()) / (rec_img_to_log.max() - rec_img_to_log.min() + 1e-8)
+        target_img_to_log = (target_img_to_log - target_img_to_log.min()) / (target_img_to_log.max() - target_img_to_log.min() + 1e-8)
+        sens_maps_to_log = (sens_maps_to_log - sens_maps_to_log.min()) / (sens_maps_to_log.max() - sens_maps_to_log.min() + 1e-8)
+        masked_target_to_log = (masked_target_to_log - masked_target_to_log.min()) / (masked_target_to_log.max() - masked_target_to_log.min() + 1e-8)
         
         # Convert to numpy
         rec_img_np = rec_img_to_log.detach().numpy()
@@ -434,7 +470,7 @@ class ReconMRIModule(pl.LightningModule):
         plt.close(fig)
 
         # Save the figure to a file (for debugging)
-        output_dir = os.path.join("/home/nicocarp/scratch/CMR-Reconstruction/outputs", mode.lower())
+        output_dir = os.path.join("/home/nicocarp/scratch/CMRxRecon/outputs", mode.lower())
         os.makedirs(output_dir, exist_ok=True)
         file_name = f'{mode.lower()}_img_step_{step}.png'
         file_path = os.path.join(output_dir, file_name)
@@ -479,10 +515,10 @@ class ReconMRIModule(pl.LightningModule):
         parser.add_argument('--use_amp', action='store_true', help='Use automatic mixed precision')
         parser.add_argument('--num_recurrent', type=int, default=25, help='Number of DCRBs')
         parser.add_argument('--sens_chans', type=int, default=32, help='Number of channels in sensitivity network')
-        parser.add_argument('--lambda0', type=float, default=10, help='Weight of the kspace loss')
-        parser.add_argument('--lambda1', type=float, default=10, help='Weight of the consistency loss in K-space')
-        parser.add_argument('--lambda2', type=float, default=1, help='Weight of the SSIM loss')
-        parser.add_argument('--lambda3', type=float, default=1e2, help='Weight of the TV Loss')
+        parser.add_argument('--alpha', type=float, default=1.0, help='Weight for SSIM loss')
+        parser.add_argument('--beta', type=float, default=1.0, help='Weight for Fidelity loss')
+        parser.add_argument('--lambda_SM', type=float, default=0.2, help='Weight for Sensitivity Consistency loss')
+
         parser.add_argument('--GT', type=bool, default=True, help='If there is GT, default is True')
 
         parser.add_argument('--num_heads', type=int, nargs='+', default=[3, 6, 12, 24], help='Number of attention heads for each transformer stage')
